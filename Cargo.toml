@@ -1,0 +1,21 @@
+[package]
+name = "vermouth"
+version = "0.1.0"
+edition = "2024"
+authors = ["LucasErrNotFound"]
+repository = "https://github.com/LucasErrNotFound/vermouth"
+description = "Provisional native IP camera desktop frontend"
+readme = "README.md"
+license-file = "LICENSE"
+publish = false
+
+[dependencies]
+gpui-kit = "0.8.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+incremental = false
