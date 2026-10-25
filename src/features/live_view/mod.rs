@@ -3,7 +3,9 @@ use gpui_kit::prelude::FluentBuilder as _;
 
 pub mod layout;
 
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, button::Button, tooltip::Tooltip};
+use gpui_kit::component::{
+    ActiveTheme as _, Icon, Sizable as _, button::Button, spinner::Spinner, tooltip::Tooltip,
+};
 use gpui_kit::*;
 
 use crate::camera::{Camera, CameraCatalog, CameraId, ConnectionState};
@@ -69,6 +71,33 @@ impl LiveView {
             ConnectionState::Connecting => cx.theme().warning,
             ConnectionState::Offline => cx.theme().muted_foreground,
             ConnectionState::Unauthorized | ConnectionState::Unsupported => cx.theme().danger,
+        };
+
+        let status_icon: AnyElement = match camera.connection {
+            ConnectionState::PreviewUnavailable => Icon::new(IconName::VideoOff)
+                .small()
+                .text_color(state_color)
+                .into_any_element(),
+            ConnectionState::Connecting => {
+                Spinner::new().small().color(state_color).into_any_element()
+            }
+            ConnectionState::Offline => Icon::new(IconName::WifiOff)
+                .small()
+                .text_color(state_color)
+                .into_any_element(),
+            ConnectionState::Unauthorized => Icon::new(IconName::LockKeyhole)
+                .small()
+                .text_color(state_color)
+                .into_any_element(),
+            ConnectionState::Unsupported => Icon::new(IconName::CircleX)
+                .small()
+                .text_color(state_color)
+                .into_any_element(),
+        };
+
+        let status_label = match camera.connection {
+            ConnectionState::Connecting => "Demo · Connecting...",
+            _ => camera.connection.label(),
         };
 
         div()
@@ -153,15 +182,24 @@ impl LiveView {
                     .py_2()
                     .child(
                         div()
+                            .flex()
                             .flex_1()
                             .min_w_0()
-                            .text_xs()
-                            .text_color(state_color)
-                            .truncate()
-                            .child(camera.connection.label()),
+                            .items_center()
+                            .gap_2()
+                            .child(status_icon)
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_xs()
+                                    .text_color(state_color)
+                                    .truncate()
+                                    .child(status_label),
+                            ),
                     )
                     .child(
                         div()
+                            .flex_shrink_0()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(if selected {
