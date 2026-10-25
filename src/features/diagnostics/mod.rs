@@ -21,9 +21,11 @@ impl Render for DiagnosticsView {
                     .child("Diagnostics"),
             )
             .child(
-                div().text_color(cx.theme().muted_foreground).child(
-                    "Device diagnostics are unavailable while network services are disabled.",
-                ),
+                div()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        "RTSP connection status and sanitized errors appear on camera tiles and in the camera list.",
+                    ),
             )
             .child(
                 div()
@@ -35,7 +37,9 @@ impl Render for DiagnosticsView {
                     .border_color(cx.theme().border)
                     .bg(cx.theme().group_box)
                     .p_4()
-                    .child(Icon::new(IconName::Activity))
+                    .child(
+                        Icon::new(IconName::Activity),
+                    )
                     .child(
                         div()
                             .flex()
@@ -43,14 +47,20 @@ impl Render for DiagnosticsView {
                             .gap_1()
                             .child(
                                 div()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child("Frontend status"),
+                                    .font_weight(
+                                        FontWeight::MEDIUM,
+                                    )
+                                    .child("Media backend"),
                             )
                             .child(
                                 div()
                                     .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("Demo mode is active · No network requests are sent"),
+                                    .text_color(
+                                        cx.theme().muted_foreground,
+                                    )
+                                    .child(
+                                        "FFmpeg · RTSP over TCP · JPEG frames · video only",
+                                    ),
                             ),
                     ),
             )
@@ -59,7 +69,7 @@ impl Render for DiagnosticsView {
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .child(
-                        "Future RTSP and ONVIF diagnostics will appear here with secrets redacted.",
+                        "No authenticated URLs, video frames, or device identifiers are written to diagnostic logs.",
                     ),
             )
     }

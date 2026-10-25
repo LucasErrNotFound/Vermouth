@@ -1,14 +1,21 @@
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
 use gpui_kit::assets::IconName;
 use gpui_kit::prelude::FluentBuilder as _;
-
-pub mod layout;
 
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _, button::Button, spinner::Spinner, tooltip::Tooltip,
 };
 use gpui_kit::*;
 
+pub mod layout;
+
 use crate::camera::{Camera, CameraCatalog, CameraId, ConnectionState};
+
 use layout::{WindowClass, grid_columns, window_class};
 
 pub struct LiveView {
@@ -17,31 +24,118 @@ pub struct LiveView {
     focused: bool,
     inspector: bool,
     navigation_collapsed: Option<bool>,
+    frames: HashMap<CameraId, (u64, Arc<RenderImage>)>,
+    retired: VecDeque<(Instant, Arc<RenderImage>)>,
     _observer: Subscription,
+    _poll_task: Task<()>,
 }
 
 impl LiveView {
     pub fn new(catalog: Entity<CameraCatalog>, cx: &mut Context<Self>) -> Self {
-        let selected = catalog.read(cx).all().first().map(|camera| camera.id);
+        let observer = cx.observe(&catalog, |view, catalog, cx| {
+            let all = catalog.read(cx).all();
 
-        let observer = cx.observe(&catalog, |this, catalog, cx| {
-            if this
+            if view
                 .selected
-                .is_some_and(|id| catalog.read(cx).get(id).is_none())
+                .is_none_or(|id| !all.iter().any(|camera| camera.id == id))
             {
-                this.selected = catalog.read(cx).all().first().map(|camera| camera.id);
+                view.selected = all.first().map(|camera| camera.id);
             }
 
             cx.notify();
         });
 
+        let task = cx.spawn(async move |weak, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(67))
+                    .await;
+
+                if weak.update(cx, |view, cx| view.tick(cx)).is_err() {
+                    break;
+                }
+            }
+        });
+
         Self {
             catalog,
-            selected,
+            selected: None,
             focused: false,
             inspector: true,
             navigation_collapsed: None,
+            frames: HashMap::new(),
+            retired: VecDeque::new(),
             _observer: observer,
+            _poll_task: task,
+        }
+    }
+
+    fn tick(&mut self, cx: &mut Context<Self>) {
+        self.catalog.update(cx, |catalog, cx| {
+            if catalog.poll() {
+                cx.notify();
+            }
+        });
+
+        let cameras = self.catalog.read(cx).all().to_vec();
+        let now = Instant::now();
+        let mut changed = false;
+
+        let removed = self
+            .frames
+            .keys()
+            .copied()
+            .filter(|id| !cameras.iter().any(|camera| camera.id == *id))
+            .collect::<Vec<_>>();
+
+        for id in removed {
+            if let Some((_, old)) = self.frames.remove(&id) {
+                self.retired.push_back((now, old));
+                changed = true;
+            }
+        }
+
+        for camera in &cameras {
+            let Some(frame) = camera.latest_frame.as_ref() else {
+                if let Some((_, old)) = self.frames.remove(&camera.id) {
+                    self.retired.push_back((now, old));
+                    changed = true;
+                }
+
+                continue;
+            };
+
+            let current = self
+                .frames
+                .get(&camera.id)
+                .is_some_and(|(revision, _)| *revision == camera.frame_revision);
+
+            if current {
+                continue;
+            }
+
+            if let Some((_, old)) = self
+                .frames
+                .insert(camera.id, (camera.frame_revision, frame.clone()))
+            {
+                self.retired.push_back((now, old));
+            }
+
+            changed = true;
+        }
+
+        while self
+            .retired
+            .front()
+            .is_some_and(|(time, _)| now.duration_since(*time) >= Duration::from_secs(1))
+        {
+            if let Some((_, image)) = self.retired.pop_front() {
+                cx.drop_image(image, None);
+            }
+        }
+
+        if changed {
+            cx.notify();
         }
     }
 
@@ -55,57 +149,97 @@ impl LiveView {
         cx.notify();
     }
 
-    fn tile(camera: Camera, selected: bool, cx: &mut Context<Self>) -> AnyElement {
-        let id = camera.id;
-        let connection_tip = camera.connection.description();
-        let card_tip = format!("Select {}", camera.name);
+    fn status(camera: &Camera, cx: &Context<Self>) -> AnyElement {
+        let color = match camera.connection {
+            ConnectionState::Offline => cx.theme().muted_foreground,
+            ConnectionState::Connecting => cx.theme().warning,
+            ConnectionState::Live => cx.theme().success,
+            ConnectionState::Stale => cx.theme().warning,
+            ConnectionState::Error => cx.theme().danger,
+        };
 
-        let accent_border = if selected {
+        let icon: AnyElement = match camera.connection {
+            ConnectionState::Offline => Icon::new(IconName::WifiOff)
+                .small()
+                .text_color(color)
+                .into_any_element(),
+            ConnectionState::Connecting => Spinner::new().small().color(color).into_any_element(),
+            ConnectionState::Live => Icon::new(IconName::CircleCheck)
+                .small()
+                .text_color(color)
+                .into_any_element(),
+            ConnectionState::Stale => Icon::new(IconName::TriangleAlert)
+                .small()
+                .text_color(color)
+                .into_any_element(),
+            ConnectionState::Error => Icon::new(IconName::CircleX)
+                .small()
+                .text_color(color)
+                .into_any_element(),
+        };
+
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_xs()
+            .text_color(color)
+            .child(icon)
+            .child(camera.connection.label())
+            .into_any_element()
+    }
+
+    fn tile(&mut self, camera: Camera, selected: bool, cx: &mut Context<Self>) -> AnyElement {
+        let id = camera.id;
+
+        let frame = self.frames.get(&id).map(|(_, frame)| frame.clone());
+
+        let border = if selected {
             cx.theme().primary
         } else {
             cx.theme().border
         };
 
-        let state_color = match camera.connection {
-            ConnectionState::PreviewUnavailable => cx.theme().info,
-            ConnectionState::Connecting => cx.theme().warning,
-            ConnectionState::Offline => cx.theme().muted_foreground,
-            ConnectionState::Unauthorized | ConnectionState::Unsupported => cx.theme().danger,
+        let status = Self::status(&camera, cx);
+
+        let middle: AnyElement = if let Some(frame) = frame {
+            img(frame)
+                .size_full()
+                .object_fit(ObjectFit::Contain)
+                .into_any_element()
+        } else {
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .child(match camera.connection {
+                    ConnectionState::Offline => "Disconnected",
+                    ConnectionState::Connecting => "Connecting to camera...",
+                    ConnectionState::Live => "Preparing video...",
+                    ConnectionState::Stale => "Waiting for video...",
+                    ConnectionState::Error => "Video unavailable",
+                })
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x94a3b8))
+                        .child(camera.detail.unwrap_or(camera.connection.description())),
+                )
+                .into_any_element()
         };
 
-        let status_icon: AnyElement = match camera.connection {
-            ConnectionState::PreviewUnavailable => Icon::new(IconName::VideoOff)
-                .small()
-                .text_color(state_color)
-                .into_any_element(),
-            ConnectionState::Connecting => {
-                Spinner::new().small().color(state_color).into_any_element()
-            }
-            ConnectionState::Offline => Icon::new(IconName::WifiOff)
-                .small()
-                .text_color(state_color)
-                .into_any_element(),
-            ConnectionState::Unauthorized => Icon::new(IconName::LockKeyhole)
-                .small()
-                .text_color(state_color)
-                .into_any_element(),
-            ConnectionState::Unsupported => Icon::new(IconName::CircleX)
-                .small()
-                .text_color(state_color)
-                .into_any_element(),
-        };
-
-        let status_label = match camera.connection {
-            ConnectionState::Connecting => "Demo · Connecting...",
-            _ => camera.connection.label(),
-        };
+        let name = camera.name;
+        let tip = format!("Select {name}");
 
         div()
             .id(format!("camera-tile-{}", id.0))
             .cursor_pointer()
-            .tooltip(move |window, cx| Tooltip::new(card_tip.clone()).build(window, cx))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.select(id, cx);
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.select(id, cx);
             }))
             .flex()
             .flex_col()
@@ -114,7 +248,7 @@ impl LiveView {
             .rounded_lg()
             .bg(cx.theme().group_box)
             .border_1()
-            .border_color(accent_border)
+            .border_color(border)
             .child(
                 div()
                     .flex()
@@ -130,47 +264,23 @@ impl LiveView {
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
                             .truncate()
-                            .child(camera.name),
+                            .child(name),
                     )
                     .child(
                         div()
-                            .id(format!("camera-status-{}", id.0))
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .tooltip(move |window, cx| {
-                                Tooltip::new(connection_tip).build(window, cx)
-                            })
-                            .child(
-                                div()
-                                    .w(px(7.))
-                                    .h(px(7.))
-                                    .flex_shrink_0()
-                                    .rounded_full()
-                                    .bg(state_color),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(if selected { "SELECTED" } else { "DEMO" }),
-                            ),
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if selected { "SELECTED" } else { "RTSP" }),
                     ),
             )
             .child(
                 div()
-                    .relative()
                     .w_full()
                     .aspect_ratio(16.0 / 9.0)
+                    .overflow_hidden()
                     .bg(rgb(0x11171e))
                     .text_color(rgb(0xc1ccd7))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap_2()
-                    .child("NO VIDEO")
-                    .child(div().text_xs().child("Preview intentionally unavailable")),
+                    .child(middle),
             )
             .child(
                 div()
@@ -180,26 +290,9 @@ impl LiveView {
                     .gap_2()
                     .px_3()
                     .py_2()
+                    .child(status)
                     .child(
                         div()
-                            .flex()
-                            .flex_1()
-                            .min_w_0()
-                            .items_center()
-                            .gap_2()
-                            .child(status_icon)
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .text_xs()
-                                    .text_color(state_color)
-                                    .truncate()
-                                    .child(status_label),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink_0()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(if selected {
@@ -212,7 +305,7 @@ impl LiveView {
             .into_any_element()
     }
 
-    fn inspector(camera: &Camera, cx: &Context<Self>) -> AnyElement {
+    fn inspector(&self, camera: &Camera, cx: &Context<Self>) -> AnyElement {
         div()
             .flex()
             .flex_col()
@@ -234,26 +327,14 @@ impl LiveView {
                     .font_weight(FontWeight::MEDIUM)
                     .child(camera.name.clone()),
             )
-            .child(info_row(
-                "Connection",
-                camera.connection.label(),
-                cx,
-            ))
-            .child(info_row(
-                "Transport",
-                camera.transport.label(),
-                cx,
-            ))
-            .child(info_row(
-                "PTZ",
-                camera.ptz.label(),
-                cx,
-            ))
+            .child(Self::status(camera, cx))
+            .child(info_row("Transport", "RTSP / TCP", cx))
+            .child(info_row("PTZ", "Not available", cx))
             .child(
                 div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child(camera.connection.description()),
+                    .child(camera.detail.unwrap_or(camera.connection.description())),
             )
             .child(
                 div()
@@ -262,9 +343,7 @@ impl LiveView {
                     .pt_3()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(
-                        "Controls and snapshot are unavailable until a real authorized camera backend is connected.",
-                    ),
+                    .child("No recording, audio, ONVIF or PTZ in this release."),
             )
             .into_any_element()
     }
@@ -287,12 +366,10 @@ fn info_row(label: &'static str, value: &'static str, cx: &Context<LiveView>) ->
 
 impl Render for LiveView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let logical_width = window.viewport_size().width.as_f32();
-        let window_class = window_class(logical_width);
-        let narrow = window_class == WindowClass::Narrow;
+        let width = window.viewport_size().width.as_f32();
+        let narrow = window_class(width) == WindowClass::Narrow;
 
-        let docked_inspector = logical_width >= 1500.0 && self.inspector;
-
+        let docked = width >= 1500.0 && self.inspector;
         let cameras = self.catalog.read(cx).all().to_vec();
 
         let selected = self
@@ -304,21 +381,20 @@ impl Render for LiveView {
             .and_then(|id| cameras.iter().find(|camera| camera.id == id))
             .cloned();
 
-        let navigation_collapsed = self.navigation_collapsed.unwrap_or(logical_width < 960.);
+        let nav_collapsed = self.navigation_collapsed.unwrap_or(width < 960.0);
 
-        let content_width = logical_width
-            - if navigation_collapsed { 62. } else { 218. }
-            - if docked_inspector { 340. } else { 0. };
+        let content_width =
+            width - if nav_collapsed { 62.0 } else { 218.0 } - if docked { 340.0 } else { 0.0 };
 
         let columns = grid_columns(
-            content_width.max(260.),
+            content_width.max(260.0),
             cameras.len(),
             self.focused || narrow,
         );
 
         let show_chooser = (self.focused || narrow) && cameras.len() > 1;
 
-        let chooser_buttons = if show_chooser {
+        let chooser = if show_chooser {
             cameras
                 .iter()
                 .map(|camera| {
@@ -332,9 +408,9 @@ impl Render for LiveView {
                         })
                         .small()
                         .cursor_pointer()
-                        .tooltip(format!("Select {} in the demo workspace", camera.name))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.select(id, cx);
+                        .tooltip(format!("Select {}", camera.name))
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.select(id, cx);
                         }))
                 })
                 .collect::<Vec<_>>()
@@ -342,32 +418,30 @@ impl Render for LiveView {
             Vec::new()
         };
 
-        let visible: Vec<_> = if self.focused || narrow {
+        let visible = if self.focused || narrow {
             cameras
                 .iter()
                 .filter(|camera| Some(camera.id) == selected)
                 .cloned()
-                .collect()
+                .collect::<Vec<_>>()
         } else {
             cameras.clone()
         };
 
-        let rows: Vec<_> = visible
-            .chunks(columns)
-            .map(|group| {
-                div()
-                    .flex()
-                    .items_start()
-                    .gap_3()
-                    .children(group.iter().map(|camera| {
-                        div().flex_1().min_w_0().child(Self::tile(
-                            camera.clone(),
-                            Some(camera.id) == selected,
-                            cx,
-                        ))
-                    }))
-            })
-            .collect();
+        let mut rows = Vec::new();
+
+        for group in visible.chunks(columns) {
+            let tiles = group
+                .iter()
+                .map(|camera| {
+                    let tile = self.tile(camera.clone(), Some(camera.id) == selected, cx);
+
+                    div().flex_1().min_w_0().child(tile)
+                })
+                .collect::<Vec<_>>();
+
+            rows.push(div().flex().items_start().gap_3().children(tiles));
+        }
 
         div()
             .flex()
@@ -395,14 +469,20 @@ impl Render for LiveView {
                             .child(
                                 div()
                                     .text_2xl()
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .font_weight(
+                                        FontWeight::SEMIBOLD,
+                                    )
                                     .child("Live View"),
                             )
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("Demo workspace · no cameras are connected"),
+                                    .text_color(
+                                        cx.theme().muted_foreground,
+                                    )
+                                    .child(
+                                        "Authorized RTSP camera streams",
+                                    ),
                             ),
                     )
                     .child(
@@ -413,17 +493,22 @@ impl Render for LiveView {
                                 Button::new("focus-view")
                                     .small()
                                     .icon(IconName::Video)
-                                    .label(if self.focused { "Grid" } else { "Focus" })
-                                    .cursor_pointer()
-                                    .tooltip(if self.focused {
-                                        "Show the camera grid"
+                                    .label(if self.focused {
+                                        "Grid"
                                     } else {
-                                        "Focus on the selected camera"
+                                        "Focus"
                                     })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.focused = !this.focused;
-                                        cx.notify();
-                                    })),
+                                    .cursor_pointer()
+                                    .tooltip(
+                                        "Toggle focused camera layout",
+                                    )
+                                    .on_click(cx.listener(
+                                        |view, _, _, cx| {
+                                            view.focused =
+                                                !view.focused;
+                                            cx.notify();
+                                        },
+                                    )),
                             )
                             .child(
                                 Button::new("inspector-toggle")
@@ -435,15 +520,16 @@ impl Render for LiveView {
                                         "Details"
                                     })
                                     .cursor_pointer()
-                                    .tooltip(if self.inspector {
-                                        "Close the camera inspector"
-                                    } else {
-                                        "Show connection and capability details"
-                                    })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.inspector = !this.inspector;
-                                        cx.notify();
-                                    })),
+                                    .tooltip(
+                                        "Toggle the camera inspector",
+                                    )
+                                    .on_click(cx.listener(
+                                        |view, _, _, cx| {
+                                            view.inspector =
+                                                !view.inspector;
+                                            cx.notify();
+                                        },
+                                    )),
                             ),
                     ),
             )
@@ -455,7 +541,7 @@ impl Render for LiveView {
                         .gap_2()
                         .px_3()
                         .pt_3()
-                        .children(chooser_buttons),
+                        .children(chooser),
                 )
             })
             .child(
@@ -478,13 +564,33 @@ impl Render for LiveView {
                                     .flex()
                                     .flex_col()
                                     .gap_3()
-                                    .when(visible.is_empty(), |view| {
-                                        view.child(empty_workspace(cx))
-                                    })
+                                    .when(
+                                        visible.is_empty(),
+                                        |view| {
+                                            view.child(
+                                                div()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .gap_2()
+                                                    .p_8()
+                                                    .text_color(
+                                                        cx.theme().muted_foreground,
+                                                    )
+                                                    .child(
+                                                        "No cameras configured",
+                                                    )
+                                                    .child(
+                                                        "Open Cameras to add an authorized RTSP stream.",
+                                                    ),
+                                            )
+                                        },
+                                    )
                                     .children(rows),
                             ),
                     )
-                    .when(docked_inspector, |body| {
+                    .when(docked, |body| {
                         body.child(
                             div()
                                 .w(px(300.))
@@ -492,13 +598,21 @@ impl Render for LiveView {
                                 .id("live-inspector-scroll")
                                 .overflow_y_scroll()
                                 .children(
-                                    chosen.as_ref().map(|camera| Self::inspector(camera, cx)),
+                                    chosen.as_ref().map(
+                                        |camera| {
+                                            self.inspector(
+                                                camera, cx,
+                                            )
+                                        },
+                                    ),
                                 ),
                         )
                     }),
             )
             .when(
-                self.inspector && !docked_inspector && chosen.is_some(),
+                self.inspector
+                    && !docked
+                    && chosen.is_some(),
                 |root| {
                     root.child(
                         div()
@@ -507,23 +621,17 @@ impl Render for LiveView {
                             .max_h(px(220.))
                             .id("compact-inspector-scroll")
                             .overflow_y_scroll()
-                            .children(chosen.as_ref().map(|camera| Self::inspector(camera, cx))),
+                            .children(
+                                chosen.as_ref().map(
+                                    |camera| {
+                                        self.inspector(
+                                            camera, cx,
+                                        )
+                                    },
+                                ),
+                            ),
                     )
                 },
             )
     }
-}
-
-fn empty_workspace(cx: &Context<LiveView>) -> AnyElement {
-    div()
-        .flex()
-        .flex_col()
-        .items_center()
-        .justify_center()
-        .gap_2()
-        .p_8()
-        .text_color(cx.theme().muted_foreground)
-        .child("No cameras configured")
-        .child("Open Cameras to add a demo camera configuration.")
-        .into_any_element()
 }

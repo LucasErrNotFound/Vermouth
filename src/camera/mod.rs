@@ -1,69 +1,50 @@
+mod stream;
+
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use gpui_kit::RenderImage;
+use stream::{StreamEvent, StreamSession};
+
+const INITIAL_RETRY_SECONDS: u64 = 2;
+const MAX_RETRY_SECONDS: u64 = 30;
+const CONNECT_TIMEOUT_SECONDS: u64 = 20;
+const STALE_AFTER_SECONDS: u64 = 6;
+const STALE_TIMEOUT_SECONDS: u64 = 18;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CameraId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
-    PreviewUnavailable,
-    Connecting,
     Offline,
-    Unauthorized,
-    Unsupported,
+    Connecting,
+    Live,
+    Stale,
+    Error,
 }
 
 impl ConnectionState {
     pub fn label(self) -> &'static str {
         match self {
-            Self::PreviewUnavailable => "Demo · Preview unavailable",
-            Self::Connecting => "Demo · Connecting",
-            Self::Offline => "Demo · Offline",
-            Self::Unauthorized => "Demo · Authentication needed",
-            Self::Unsupported => "Demo · Unsupported",
+            Self::Offline => "Disconnected",
+            Self::Connecting => "Connecting...",
+            Self::Live => "Live",
+            Self::Stale => "Stream stale",
+            Self::Error => "Connection failed",
         }
     }
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::PreviewUnavailable => "No video is connected in the frontend demonstrator.",
-            Self::Connecting => "Simulated connection state. No network request is being made.",
-            Self::Offline => "The simulated device is unavailable.",
-            Self::Unauthorized => {
-                "Simulated authentication failure. No credentials are required here."
-            }
-            Self::Unsupported => "This simulated configuration has an unsupported feature.",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CameraTransport {
-    Rtsp,
-    OnvifRtsp,
-}
-
-impl CameraTransport {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Rtsp => "RTSP",
-            Self::OnvifRtsp => "ONVIF + RTSP",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Capability {
-    Unknown,
-    Advertised,
-    Verified,
-    Unsupported,
-}
-
-impl Capability {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Unknown => "Unknown",
-            Self::Advertised => "Advertised (demo)",
-            Self::Verified => "Verified (demo fixture only)",
-            Self::Unsupported => "Unsupported",
+            Self::Offline => "The stream is disconnected.",
+            Self::Connecting => "Waiting for the first decoded video frame.",
+            Self::Live => "Decoded video frames are arriving.",
+            Self::Stale => "No recent video frames have arrived.",
+            Self::Error => "The stream failed. Vermouth will retry automatically.",
         }
     }
 }
@@ -73,164 +54,318 @@ pub struct Camera {
     pub id: CameraId,
     pub name: String,
     pub rtsp_address: String,
-    pub transport: CameraTransport,
     pub connection: ConnectionState,
-    pub ptz: Capability,
+    pub detail: Option<&'static str>,
+    pub latest_frame: Option<Arc<RenderImage>>,
+    pub frame_revision: u64,
+    pub last_frame_at: Option<Instant>,
+    started_at: Option<Instant>,
+    stable_since: Option<Instant>,
+    wants_connection: bool,
+    retry_delay_seconds: u64,
+    next_retry_at: Option<Instant>,
 }
 
 pub struct CameraCatalog {
     records: Vec<Camera>,
     next_id: u64,
+    sessions: HashMap<CameraId, StreamSession>,
 }
 
 impl CameraCatalog {
-    pub fn demo() -> Self {
-        let mut catalog = Self {
+    pub fn new() -> Self {
+        Self {
             records: Vec::new(),
             next_id: 1,
-        };
-        for (name, path, transport, connection, ptz) in [
-            (
-                "Front Entrance",
-                "front",
-                CameraTransport::OnvifRtsp,
-                ConnectionState::PreviewUnavailable,
-                Capability::Advertised,
-            ),
-            (
-                "Driveway",
-                "driveway",
-                CameraTransport::Rtsp,
-                ConnectionState::Offline,
-                Capability::Unsupported,
-            ),
-            (
-                "Hallway",
-                "hallway",
-                CameraTransport::OnvifRtsp,
-                ConnectionState::Connecting,
-                Capability::Verified,
-            ),
-            (
-                "Workshop",
-                "workshop",
-                CameraTransport::Rtsp,
-                ConnectionState::Unauthorized,
-                Capability::Unsupported,
-            ),
-            (
-                "Back Garden",
-                "garden",
-                CameraTransport::Rtsp,
-                ConnectionState::Unsupported,
-                Capability::Unsupported,
-            ),
-        ] {
-            let id = CameraId(catalog.next_id);
-            catalog.next_id += 1;
-            catalog.records.push(Camera {
-                id,
-                name: name.to_owned(),
-                rtsp_address: format!("rtsp://demo.invalid/{path}"),
-                transport,
-                connection,
-                ptz,
-            });
+            sessions: HashMap::new(),
         }
-        catalog
     }
 
     pub fn all(&self) -> &[Camera] {
         &self.records
     }
+
     pub fn get(&self, id: CameraId) -> Option<&Camera> {
-        self.records.iter().find(|c| c.id == id)
+        self.records.iter().find(|camera| camera.id == id)
     }
 
-    pub fn add(&mut self, name: &str, address: &str, onvif: bool) -> Result<CameraId, String> {
+    pub fn add(&mut self, name: &str, address: &str) -> Result<CameraId, String> {
         self.validate(None, name, address)?;
+
         let id = CameraId(self.next_id);
         self.next_id += 1;
+
         self.records.push(Camera {
             id,
             name: name.trim().to_owned(),
             rtsp_address: address.trim().to_owned(),
-            transport: if onvif {
-                CameraTransport::OnvifRtsp
-            } else {
-                CameraTransport::Rtsp
-            },
-            connection: ConnectionState::PreviewUnavailable,
-            ptz: Capability::Unknown,
+            connection: ConnectionState::Offline,
+            detail: None,
+            latest_frame: None,
+            frame_revision: 0,
+            last_frame_at: None,
+            started_at: None,
+            stable_since: None,
+            wants_connection: false,
+            retry_delay_seconds: INITIAL_RETRY_SECONDS,
+            next_retry_at: None,
         });
+
+        self.connect(id)?;
         Ok(id)
     }
 
-    pub fn update(
-        &mut self,
-        id: CameraId,
-        name: &str,
-        address: &str,
-        onvif: bool,
-    ) -> Result<(), String> {
+    pub fn update(&mut self, id: CameraId, name: &str, address: &str) -> Result<(), String> {
+        if self.get(id).is_none() {
+            return Err("Camera no longer exists".into());
+        }
+
         self.validate(Some(id), name, address)?;
+        self.disconnect(id);
+
         let camera = self
             .records
             .iter_mut()
-            .find(|c| c.id == id)
-            .ok_or("Camera no longer exists")?;
+            .find(|camera| camera.id == id)
+            .expect("camera exists");
+
         camera.name = name.trim().to_owned();
         camera.rtsp_address = address.trim().to_owned();
-        camera.transport = if onvif {
-            CameraTransport::OnvifRtsp
-        } else {
-            CameraTransport::Rtsp
-        };
-        Ok(())
+
+        self.connect(id)
     }
 
     pub fn remove(&mut self, id: CameraId) -> bool {
+        self.disconnect(id);
+
         let before = self.records.len();
-        self.records.retain(|c| c.id != id);
+
+        self.records.retain(|camera| camera.id != id);
+
         before != self.records.len()
+    }
+
+    pub fn connect(&mut self, id: CameraId) -> Result<(), String> {
+        self.start_connection(id, true)
+    }
+
+    fn start_connection(&mut self, id: CameraId, reset_backoff: bool) -> Result<(), String> {
+        self.sessions.remove(&id);
+
+        let camera = self
+            .records
+            .iter_mut()
+            .find(|camera| camera.id == id)
+            .ok_or("Camera no longer exists")?;
+
+        if reset_backoff {
+            camera.retry_delay_seconds = INITIAL_RETRY_SECONDS;
+        }
+
+        camera.wants_connection = true;
+        camera.connection = ConnectionState::Connecting;
+        camera.detail = None;
+        camera.started_at = Some(Instant::now());
+        camera.stable_since = None;
+        camera.last_frame_at = None;
+        camera.next_retry_at = None;
+
+        let session = StreamSession::start(camera.rtsp_address.clone());
+
+        self.sessions.insert(id, session);
+        Ok(())
+    }
+
+    pub fn disconnect(&mut self, id: CameraId) {
+        self.sessions.remove(&id);
+
+        if let Some(camera) = self.records.iter_mut().find(|camera| camera.id == id) {
+            camera.wants_connection = false;
+            camera.connection = ConnectionState::Offline;
+            camera.detail = None;
+            camera.latest_frame = None;
+            camera.last_frame_at = None;
+            camera.started_at = None;
+            camera.stable_since = None;
+            camera.next_retry_at = None;
+            camera.retry_delay_seconds = INITIAL_RETRY_SECONDS;
+        }
+    }
+
+    fn mark_failure(camera: &mut Camera, reason: &'static str, now: Instant) {
+        camera.connection = ConnectionState::Error;
+        camera.detail = Some(reason);
+        camera.started_at = None;
+        camera.stable_since = None;
+
+        if camera.wants_connection {
+            camera.next_retry_at = Some(now + Duration::from_secs(camera.retry_delay_seconds));
+
+            camera.retry_delay_seconds = camera
+                .retry_delay_seconds
+                .saturating_mul(2)
+                .min(MAX_RETRY_SECONDS);
+        } else {
+            camera.next_retry_at = None;
+        }
+    }
+
+    pub fn poll(&mut self) -> bool {
+        let now = Instant::now();
+        let mut changed = false;
+
+        let events = self
+            .sessions
+            .iter()
+            .filter_map(|(&id, session)| session.take_event().map(|event| (id, event)))
+            .collect::<Vec<_>>();
+
+        for (id, event) in events {
+            match event {
+                StreamEvent::Frame(frame) => {
+                    if let Some(camera) = self
+                        .records
+                        .iter_mut()
+                        .find(|camera| camera.id == id && camera.wants_connection)
+                    {
+                        if camera.stable_since.is_none() {
+                            camera.stable_since = Some(now);
+                        }
+
+                        camera.latest_frame = Some(frame);
+                        camera.frame_revision = camera.frame_revision.wrapping_add(1);
+                        camera.last_frame_at = Some(now);
+                        camera.connection = ConnectionState::Live;
+                        camera.detail = None;
+
+                        changed = true;
+                    }
+                }
+
+                StreamEvent::Failed(reason) => {
+                    if let Some(camera) = self.records.iter_mut().find(|camera| camera.id == id) {
+                        Self::mark_failure(camera, reason, now);
+                        changed = true;
+                    }
+
+                    self.sessions.remove(&id);
+                }
+            }
+        }
+
+        for camera in &mut self.records {
+            if camera.connection == ConnectionState::Live
+                && camera
+                    .stable_since
+                    .is_some_and(|since| now.duration_since(since) >= Duration::from_secs(30))
+            {
+                camera.retry_delay_seconds = INITIAL_RETRY_SECONDS;
+            }
+
+            if camera.connection == ConnectionState::Live
+                && camera.last_frame_at.is_some_and(|last| {
+                    now.duration_since(last) >= Duration::from_secs(STALE_AFTER_SECONDS)
+                })
+            {
+                camera.connection = ConnectionState::Stale;
+                changed = true;
+            }
+        }
+
+        let expired = self
+            .records
+            .iter()
+            .filter_map(|camera| {
+                if !camera.wants_connection {
+                    return None;
+                }
+
+                let timed_out = match camera.connection {
+                    ConnectionState::Connecting => camera.started_at.is_some_and(|started| {
+                        now.duration_since(started) >= Duration::from_secs(CONNECT_TIMEOUT_SECONDS)
+                    }),
+                    ConnectionState::Stale => camera.last_frame_at.is_some_and(|last| {
+                        now.duration_since(last) >= Duration::from_secs(STALE_TIMEOUT_SECONDS)
+                    }),
+                    _ => false,
+                };
+
+                if timed_out { Some(camera.id) } else { None }
+            })
+            .collect::<Vec<_>>();
+
+        for id in expired {
+            self.sessions.remove(&id);
+
+            if let Some(camera) = self.records.iter_mut().find(|camera| camera.id == id) {
+                Self::mark_failure(camera, "The stream stopped delivering video frames.", now);
+
+                changed = true;
+            }
+        }
+
+        let retry_ids = self
+            .records
+            .iter()
+            .filter(|camera| {
+                camera.wants_connection
+                    && camera.connection == ConnectionState::Error
+                    && camera.next_retry_at.is_some_and(|time| now >= time)
+            })
+            .map(|camera| camera.id)
+            .collect::<Vec<_>>();
+
+        for id in retry_ids {
+            if self.start_connection(id, false).is_ok() {
+                changed = true;
+            }
+        }
+
+        changed
     }
 
     fn validate(&self, editing: Option<CameraId>, name: &str, address: &str) -> Result<(), String> {
         let name = name.trim();
         let address = address.trim();
-        if name.is_empty() {
-            return Err("Enter a camera name.".into());
+
+        if name.is_empty() || name.chars().count() > 80 {
+            return Err("Camera name must contain 1–80 characters.".into());
         }
-        if name.chars().count() > 80 {
-            return Err("Camera name must have at most 80 characters.".into());
+
+        if address.len() > 2048 || address.contains(char::is_whitespace) {
+            return Err("Enter a valid RTSP address with no spaces.".into());
         }
-        if address.len() > 2048 {
-            return Err("RTSP address is too long.".into());
-        }
-        if address.contains('?') || address.contains('#') {
-            return Err("Query strings and fragments are not accepted in this demo because they may contain secrets.".into());
-        }
-        if !(address.starts_with("rtsp://") || address.starts_with("rtsps://")) {
-            return Err("Address must begin with rtsp:// or rtsps://.".into());
-        }
-        let authority = address
-            .split_once("://")
-            .map(|(_, rest)| rest.split('/').next().unwrap_or(""))
-            .unwrap_or("");
+
+        let Some(rest) = address.strip_prefix("rtsp://") else {
+            return Err("Enter an rtsp:// URL.".into());
+        };
+
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+
         if authority.is_empty()
             || authority.contains('@')
-            || authority.chars().any(char::is_whitespace)
+            || address.contains('?')
+            || address.contains('#')
         {
-            return Err("Enter a host without embedded credentials or spaces.".into());
+            return Err(
+                "Embedded credentials and query tokens are not supported. Use a credential-free RTSP URL."
+                    .into(),
+            );
         }
-        if self
-            .records
-            .iter()
-            .any(|c| Some(c.id) != editing && c.rtsp_address.eq_ignore_ascii_case(address))
-        {
-            return Err("A camera with this RTSP address already exists.".into());
+
+        if self.records.iter().any(|camera| {
+            Some(camera.id) != editing && camera.rtsp_address.eq_ignore_ascii_case(address)
+        }) {
+            return Err("This RTSP address is already configured.".into());
         }
+
         Ok(())
+    }
+}
+
+impl Default for CameraCatalog {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -239,55 +374,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fixture_is_synthetic_and_covers_failure_modes() {
-        let cameras = CameraCatalog::demo();
-        assert_eq!(cameras.all().len(), 5);
+    fn catalog_starts_empty() {
+        let catalog = CameraCatalog::new();
+        assert!(catalog.all().is_empty());
+    }
+
+    #[test]
+    fn rejects_unsafe_rtsp_addresses() {
+        let mut catalog = CameraCatalog::new();
+
+        assert!(catalog.add("", "rtsp://192.168.1.10/live").is_err());
+
         assert!(
-            cameras
-                .all()
-                .iter()
-                .all(|c| c.rtsp_address.contains("demo.invalid"))
+            catalog
+                .add("Front", "rtsp://user:pass@192.168.1.10/live",)
+                .is_err()
         );
+
         assert!(
-            cameras
-                .all()
-                .iter()
-                .all(|c| c.connection != ConnectionState::PreviewUnavailable
-                    || c.connection.label().starts_with("Demo"))
+            catalog
+                .add("Front", "rtsp://192.168.1.10/live?token=secret",)
+                .is_err()
         );
     }
 
     #[test]
-    fn add_edit_delete_and_duplicate_validation() {
-        let mut catalog = CameraCatalog::demo();
-        let id = catalog
-            .add("Office", "rtsp://demo.invalid/office", false)
-            .unwrap();
-        assert!(
-            catalog
-                .add("Duplicate", "rtsp://demo.invalid/office", false)
-                .is_err()
-        );
-        assert!(
-            catalog
-                .add("Secret", "rtsp://admin:password@demo.invalid/stream", false)
-                .is_err()
-        );
-        assert!(
-            catalog
-                .add("Secret", "rtsp://demo.invalid/stream?token=secret", false)
-                .is_err()
-        );
-        assert!(
-            catalog
-                .update(id, "Office 2", "rtsp://demo.invalid/new", true)
-                .is_ok()
-        );
-        assert_eq!(
-            catalog.get(id).unwrap().transport,
-            CameraTransport::OnvifRtsp
-        );
-        assert!(catalog.remove(id));
-        assert!(catalog.get(id).is_none());
+    fn retry_delay_is_bounded() {
+        let now = Instant::now();
+
+        let mut camera = Camera {
+            id: CameraId(1),
+            name: "Test".into(),
+            rtsp_address: "rtsp://example.invalid/live".into(),
+            connection: ConnectionState::Connecting,
+            detail: None,
+            latest_frame: None,
+            frame_revision: 0,
+            last_frame_at: None,
+            started_at: None,
+            stable_since: None,
+            wants_connection: true,
+            retry_delay_seconds: INITIAL_RETRY_SECONDS,
+            next_retry_at: None,
+        };
+
+        for _ in 0..20 {
+            CameraCatalog::mark_failure(&mut camera, "Test failure", now);
+        }
+
+        assert_eq!(camera.retry_delay_seconds, MAX_RETRY_SECONDS);
+        assert!(camera.next_retry_at.is_some());
     }
 }

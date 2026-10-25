@@ -11,6 +11,8 @@ publish = false
 
 [dependencies]
 gpui-kit = "0.8.0"
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
+smallvec = "1.16.4"
 
 [profile.release]
 opt-level = 3

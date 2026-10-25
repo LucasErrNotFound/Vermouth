@@ -6752,6 +6752,8 @@ name = "vermouth"
 version = "0.1.0"
 dependencies = [
  "gpui-kit",
+ "image",
+ "smallvec",
 ]
 
 [[package]]

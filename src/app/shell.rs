@@ -69,7 +69,7 @@ pub struct AppShell {
 
 impl AppShell {
     pub fn new(prefs: Preferences, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let catalog = cx.new(|_| CameraCatalog::demo());
+        let catalog = cx.new(|_| CameraCatalog::new());
         let settings = cx.new(|_| SettingsView::new(prefs));
 
         let settings_observer = cx.observe(&settings, |_, _, cx| cx.notify());
