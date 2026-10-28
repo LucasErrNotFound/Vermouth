@@ -1,20 +1,46 @@
+mod discovery;
+
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
+    thread,
+    time::Duration,
+};
+
 use gpui_kit::assets::IconName;
 use gpui_kit::prelude::FluentBuilder as _;
 
 use gpui_kit::component::{
-    ActiveTheme as _, WindowExt as _,
+    ActiveTheme as _, Icon, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     input::{Input, InputEvent, InputState},
     notification::Notification,
+    spinner::Spinner,
 };
 use gpui_kit::*;
 
 use crate::camera::{Camera, CameraCatalog, CameraId, ConnectionState};
 
+use discovery::{DiscoveredCamera, configured_camera_ip};
+
+type ScanResult = Result<Vec<DiscoveredCamera>, String>;
+
 pub struct CamerasView {
     catalog: Entity<CameraCatalog>,
     search: Entity<InputState>,
+    discovered: Vec<DiscoveredCamera>,
+    scanning: bool,
+    scan_complete: bool,
+    scan_message: Option<String>,
+    scan_cancel: Option<Arc<AtomicBool>>,
+    scan_tx: Sender<ScanResult>,
+    scan_rx: Receiver<ScanResult>,
     _subscriptions: Vec<Subscription>,
+    _scan_task: Task<()>,
 }
 
 impl CamerasView {
@@ -35,22 +61,121 @@ impl CamerasView {
             }
         });
 
+        let (scan_tx, scan_rx) = mpsc::channel();
+
+        let scan_task = cx.spawn_in(window, async move |weak, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+
+                if weak
+                    .update_in(cx, |view, _, cx| {
+                        view.poll_scan(cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
         Self {
             catalog,
             search,
+            discovered: Vec::new(),
+            scanning: false,
+            scan_complete: false,
+            scan_message: None,
+            scan_cancel: None,
+            scan_tx,
+            scan_rx,
             _subscriptions: vec![observer, subscription],
+            _scan_task: scan_task,
         }
     }
 
-    fn open_editor(
+    fn start_scan(&mut self, cx: &mut Context<Self>) {
+        if self.scanning {
+            if let Some(cancel) = &self.scan_cancel {
+                cancel.store(true, Ordering::Relaxed);
+
+                self.scan_message = Some("Cancelling the current network scan...".into());
+
+                cx.notify();
+            }
+
+            return;
+        }
+
+        self.discovered.clear();
+        self.scanning = true;
+        self.scan_complete = false;
+        self.scan_message = None;
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancelled);
+        let tx = self.scan_tx.clone();
+
+        self.scan_cancel = Some(cancelled);
+
+        thread::spawn(move || {
+            let result = discovery::scan(worker_cancel);
+            let _ = tx.send(result);
+        });
+
+        cx.notify();
+    }
+
+    fn poll_scan(&mut self, cx: &mut Context<Self>) {
+        while let Ok(outcome) = self.scan_rx.try_recv() {
+            self.scanning = false;
+            self.scan_complete = true;
+            self.scan_cancel = None;
+
+            match outcome {
+                Ok(cameras) => {
+                    self.discovered = cameras;
+                    self.scan_message = None;
+                }
+                Err(message) => {
+                    self.discovered.clear();
+                    self.scan_message = Some(message);
+                }
+            }
+
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn open_editor(
         &mut self,
         editing: Option<CameraId>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.show_editor(editing, None, window, cx);
+    }
+
+    fn open_discovered(
+        &mut self,
+        discovered: DiscoveredCamera,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_editor(None, Some(discovered), window, cx);
+    }
+
+    fn show_editor(
+        &mut self,
+        editing: Option<CameraId>,
+        discovered: Option<DiscoveredCamera>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let catalog = self.catalog.clone();
 
-        let editor = cx.new(|cx| CameraForm::new(catalog, editing, window, cx));
+        let editor = cx.new(|cx| CameraForm::new(catalog, editing, discovered, window, cx));
 
         window.open_dialog(cx, move |dialog, _, _| {
             dialog
@@ -78,7 +203,12 @@ impl CamerasView {
         });
     }
 
-    fn confirm_remove(&mut self, id: CameraId, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn confirm_remove(
+        &mut self,
+        id: CameraId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let name = self
             .catalog
             .read(cx)
@@ -246,27 +376,142 @@ impl CamerasView {
             )
             .into_any_element()
     }
+
+    fn discovered_row(&mut self, device: DiscoveredCamera, cx: &mut Context<Self>) -> AnyElement {
+        let address = device.address.to_string();
+        let description = device.service_summary();
+
+        let accent = if device.onvif_advertised {
+            cx.theme().success
+        } else if device.v380_advertised {
+            cx.theme().info
+        } else {
+            cx.theme().warning
+        };
+
+        let label = if device.onvif_advertised {
+            "ONVIF device discovered"
+        } else if device.v380_advertised {
+            "V380 device discovered"
+        } else {
+            "Possible camera or network service"
+        };
+
+        div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .p_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().group_box)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(36.))
+                    .h(px(36.))
+                    .rounded_lg()
+                    .bg(cx.theme().secondary)
+                    .child(Icon::new(IconName::Camera).text_color(accent)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(address),
+                            )
+                            .child(div().text_xs().text_color(accent).child(label)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(description),
+                    ),
+            )
+            .child(
+                Button::new(format!("configure-discovered-{}", device.address))
+                    .icon(IconName::Plus)
+                    .label("Configure")
+                    .cursor_pointer()
+                    .tooltip("Configure an authorized RTSP stream for this device")
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        view.open_discovered(device.clone(), window, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+}
+
+impl Drop for CamerasView {
+    fn drop(&mut self) {
+        if let Some(cancel) = &self.scan_cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 impl Render for CamerasView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let query = self.search.read(cx).value().to_lowercase();
 
-        let filtered = self
-            .catalog
-            .read(cx)
-            .all()
+        let configured = self.catalog.read(cx).all().to_vec();
+
+        let configured_addresses = configured
             .iter()
-            .filter(|camera| camera.name.to_lowercase().contains(&query))
+            .filter_map(|camera| configured_camera_ip(&camera.rtsp_address))
+            .collect::<HashSet<_>>();
+
+        let added = configured
+            .into_iter()
+            .filter(|camera| {
+                camera.name.to_lowercase().contains(&query)
+                    || camera.rtsp_address.to_lowercase().contains(&query)
+            })
+            .collect::<Vec<_>>();
+
+        let discovered = self
+            .discovered
+            .iter()
+            .filter(|device| {
+                !configured_addresses.contains(&device.address)
+                    && (query.is_empty()
+                        || device.address.to_string().contains(&query)
+                        || device.service_summary().to_lowercase().contains(&query))
+            })
             .cloned()
             .collect::<Vec<_>>();
 
-        let empty = filtered.is_empty();
+        let added_count = added.len();
+        let discovered_count = discovered.len();
 
-        let rows = filtered
+        let added_rows = added
             .into_iter()
             .map(|camera| self.camera_row(camera, cx))
             .collect::<Vec<_>>();
+
+        let discovered_rows = discovered
+            .into_iter()
+            .map(|device| self.discovered_row(device, cx))
+            .collect::<Vec<_>>();
+
+        let muted = cx.theme().muted_foreground;
+        let border = cx.theme().border;
 
         div()
             .flex()
@@ -281,11 +526,11 @@ impl Render for CamerasView {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .gap_2()
+                    .gap_3()
                     .px_5()
                     .py_4()
                     .border_b_1()
-                    .border_color(cx.theme().border)
+                    .border_color(border)
                     .child(
                         div()
                             .flex()
@@ -295,61 +540,235 @@ impl Render for CamerasView {
                             .child(
                                 div()
                                     .text_2xl()
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .font_weight(
+                                        FontWeight::SEMIBOLD,
+                                    )
                                     .child("Cameras"),
                             )
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("Manage authorized RTSP camera connections"),
+                                    .text_color(muted)
+                                    .child(
+                                        "Manage configured cameras and discover local devices",
+                                    ),
                             ),
                     )
                     .child(
-                        Button::new("add-camera")
-                            .primary()
-                            .icon(IconName::Plus)
-                            .label("Add camera")
-                            .cursor_pointer()
-                            .tooltip("Add an authorized RTSP source")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.open_editor(None, window, cx);
-                            })),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("scan-cameras")
+                                    .outline()
+                                    .icon(if self.scanning {
+                                        IconName::X
+                                    } else {
+                                        IconName::Search
+                                    })
+                                    .label(if self.scanning {
+                                        "Cancel scan"
+                                    } else {
+                                        "Scan for Cameras"
+                                    })
+                                    .cursor_pointer()
+                                    .tooltip(if self.scanning {
+                                        "Cancel the current LAN scan"
+                                    } else {
+                                        "Search private local networks for camera services"
+                                    })
+                                    .on_click(cx.listener(
+                                        |view, _, _, cx| {
+                                            view.start_scan(cx);
+                                        },
+                                    )),
+                            )
+                            .child(
+                                Button::new("add-camera")
+                                    .primary()
+                                    .icon(IconName::Plus)
+                                    .label("Add Camera")
+                                    .cursor_pointer()
+                                    .tooltip(
+                                        "Manually add an authorized RTSP source",
+                                    )
+                                    .on_click(cx.listener(
+                                        |view, _, window, cx| {
+                                            view.open_editor(
+                                                None,
+                                                window,
+                                                cx,
+                                            );
+                                        },
+                                    )),
+                            ),
                     ),
             )
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .min_h_0()
                     .flex_1()
-                    .p_4()
+                    .min_h_0()
                     .gap_3()
-                    .child(Input::new(&self.search).cleanable(true))
+                    .p_4()
+                    .child(
+                        Input::new(&self.search)
+                            .cleanable(true),
+                    )
                     .child(
                         div()
                             .id("camera-list-scroll")
-                            .min_h_0()
                             .flex_1()
+                            .min_h_0()
                             .overflow_y_scroll()
                             .child(
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .gap_2()
-                                    .when(empty, |list| {
-                                        list.child(
-                                            div()
-                                                .p_8()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(if query.is_empty() {
-                                                    "No cameras added. Select Add camera to begin."
-                                                } else {
-                                                    "No cameras match this search."
-                                                }),
-                                        )
-                                    })
-                                    .children(rows),
+                                    .gap_4()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                Icon::new(IconName::Video)
+                                                    .text_color(muted),
+                                            )
+                                            .child(
+                                                div()
+                                                    .font_weight(
+                                                        FontWeight::SEMIBOLD,
+                                                    )
+                                                    .child(format!(
+                                                        "Added Cameras ({added_count})"
+                                                    )),
+                                            ),
+                                    )
+                                    .when(
+                                        added_count == 0,
+                                        |section| {
+                                            section.child(
+                                                div()
+                                                    .p_5()
+                                                    .rounded_lg()
+                                                    .border_1()
+                                                    .border_color(border)
+                                                    .text_sm()
+                                                    .text_color(muted)
+                                                    .child(if query.is_empty() {
+                                                        "No cameras added yet. Add a camera manually or scan your network."
+                                                    } else {
+                                                        "No added cameras match your search."
+                                                    }),
+                                            )
+                                        },
+                                    )
+                                    .children(added_rows)
+                                    .child(
+                                        div()
+                                            .border_t_1()
+                                            .border_color(border)
+                                            .pt_4()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap_2()
+                                                    .child(
+                                                        Icon::new(
+                                                            IconName::Search,
+                                                        )
+                                                        .text_color(muted),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .font_weight(
+                                                                FontWeight::SEMIBOLD,
+                                                            )
+                                                            .child(format!(
+                                                                "Discovered Cameras ({discovered_count})"
+                                                            )),
+                                                    ),
+                                            )
+                                            .when(
+                                                self.scanning,
+                                                |heading| {
+                                                    heading.child(
+                                                        div()
+                                                            .flex()
+                                                            .items_center()
+                                                            .gap_2()
+                                                            .text_sm()
+                                                            .text_color(
+                                                                cx.theme().info,
+                                                            )
+                                                            .child(
+                                                                Spinner::new()
+                                                                    .small()
+                                                                    .color(
+                                                                        cx.theme().info,
+                                                                    ),
+                                                            )
+                                                            .child("Scanning LAN"),
+                                                    )
+                                                },
+                                            ),
+                                    )
+                                    .when_some(
+                                        self.scan_message.clone(),
+                                        |section, message| {
+                                            section.child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(
+                                                        cx.theme().warning,
+                                                    )
+                                                    .child(message),
+                                            )
+                                        },
+                                    )
+                                    .when(
+                                        discovered_count == 0,
+                                        |section| {
+                                            section.child(
+                                                div()
+                                                    .p_5()
+                                                    .rounded_lg()
+                                                    .border_1()
+                                                    .border_color(border)
+                                                    .text_sm()
+                                                    .text_color(muted)
+                                                    .child(
+                                                        if self.scanning {
+                                                            "Searching local network interfaces..."
+                                                        } else if !self.scan_complete {
+                                                            "Select Scan for Cameras to find devices on your local network."
+                                                        } else if !query.is_empty() {
+                                                            "No discovered devices match your search."
+                                                        } else {
+                                                            "No additional camera candidates were found."
+                                                        },
+                                                    ),
+                                            )
+                                        },
+                                    )
+                                    .children(discovered_rows)
+                                    .child(
+                                        div()
+                                            .pt_2()
+                                            .text_xs()
+                                            .text_color(muted)
+                                            .child(
+                                                "Discovery is limited to private local networks. An open port does not guarantee camera compatibility, RTSP access, or ONVIF support.",
+                                            ),
+                                    ),
                             ),
                     ),
             )
@@ -361,6 +780,7 @@ struct CameraForm {
     editing: Option<CameraId>,
     name: Entity<InputState>,
     address: Entity<InputState>,
+    hint: Option<String>,
     error: Option<String>,
 }
 
@@ -368,10 +788,35 @@ impl CameraForm {
     fn new(
         catalog: Entity<CameraCatalog>,
         editing: Option<CameraId>,
+        discovered: Option<DiscoveredCamera>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let initial = editing.and_then(|id| catalog.read(cx).get(id).cloned());
+
+        let suggested_name = discovered
+            .as_ref()
+            .map(|device| format!("Camera {}", device.address))
+            .unwrap_or_default();
+
+        let suggested_address = discovered
+            .as_ref()
+            .and_then(|device| {
+                device
+                    .rtsp_port()
+                    .map(|port| format!("rtsp://{}:{port}/", device.address))
+            })
+            .unwrap_or_default();
+
+        let hint = discovered.as_ref().map(|device| {
+            if device.rtsp_port().is_some() {
+                "The RTSP address is a starting point only. Confirm the camera's actual stream path before saving."
+                    .to_owned()
+            } else {
+                "No standard RTSP port was detected. Enable RTSP on the camera or provide its supported stream URL. Proprietary V380 streaming is not yet implemented."
+                    .to_owned()
+            }
+        });
 
         let name = cx.new(|cx| {
             InputState::new(window, cx)
@@ -380,7 +825,7 @@ impl CameraForm {
                     initial
                         .as_ref()
                         .map(|camera| camera.name.as_str())
-                        .unwrap_or(""),
+                        .unwrap_or(&suggested_name),
                 )
         });
 
@@ -391,7 +836,7 @@ impl CameraForm {
                     initial
                         .as_ref()
                         .map(|camera| camera.rtsp_address.as_str())
-                        .unwrap_or(""),
+                        .unwrap_or(&suggested_address),
                 )
         });
 
@@ -400,6 +845,7 @@ impl CameraForm {
             editing,
             name,
             address,
+            hint,
             error: None,
         }
     }
@@ -458,10 +904,23 @@ impl Render for CameraForm {
             .child(
                 div()
                     .text_sm()
-                    .text_color(cx.theme().muted_foreground)
+                    .text_color(
+                        cx.theme().muted_foreground,
+                    )
                     .child(
-                        "Only add cameras you are authorized to view. FFmpeg must be installed. Credentials and query tokens are not supported in this first release.",
+                        "Only add cameras you are authorized to view. FFmpeg must be installed. Credentials and query tokens are not supported in this release.",
                     ),
+            )
+            .when_some(
+                self.hint.clone(),
+                |form, hint| {
+                    form.child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().warning)
+                            .child(hint),
+                    )
+                },
             )
             .child(
                 div()
