@@ -74,10 +74,14 @@ impl AppShell {
 
         let settings_observer = cx.observe(&settings, |_, _, cx| cx.notify());
 
+        let cameras = cx.new(|cx| CamerasView::new(catalog.clone(), window, cx));
+
+        let live = cx.new(|cx| LiveView::new(catalog.clone(), cameras.clone(), window, cx));
+
         Self {
             page: Page::Live,
-            live: cx.new(|cx| LiveView::new(catalog.clone(), cx)),
-            cameras: cx.new(|cx| CamerasView::new(catalog, window, cx)),
+            live,
+            cameras,
             recordings: cx.new(|_| RecordingsView),
             diagnostics: cx.new(|_| DiagnosticsView),
             settings,
@@ -95,6 +99,7 @@ impl AppShell {
 
     fn toggle_sidebar(&mut self, collapsed: bool, cx: &mut Context<Self>) {
         let next = !collapsed;
+
         self.sidebar_preference = Some(next);
 
         self.live.update(cx, |live, cx| {
