@@ -622,8 +622,8 @@ impl LiveView {
 
         let header = if allow_drag {
             header
-                .cursor(CursorStyle::OpenHand)
-                .active(|style| style.cursor(CursorStyle::ClosedHand))
+                .cursor_crosshair()
+                .active(|style| style.cursor_crosshair())
                 .tooltip(|window, cx| Tooltip::new("Drag to rearrange cameras").build(window, cx))
                 .on_drag(drag_payload, move |drag, _, _, cx| {
                     let _ = weak_drag.update(cx, |view, cx| {
