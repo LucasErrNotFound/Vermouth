@@ -1,4 +1,5 @@
 mod discovery;
+mod rtsp_candidates;
 
 use std::{
     collections::HashSet,
@@ -17,6 +18,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
+    dialog::DialogEntrance,
     input::{Input, InputEvent, InputState},
     notification::Notification,
     spinner::Spinner,
@@ -26,6 +28,7 @@ use gpui_kit::*;
 use crate::camera::{Camera, CameraCatalog, CameraId, ConnectionState};
 
 use discovery::{DiscoveredCamera, configured_camera_ip};
+use rtsp_candidates::{Candidate, ProbeResult};
 
 type ScanResult = Result<Vec<DiscoveredCamera>, String>;
 
@@ -178,11 +181,22 @@ impl CamerasView {
         let editor = cx.new(|cx| CameraForm::new(catalog, editing, discovered, window, cx));
 
         window.open_dialog(cx, move |dialog, _, _| {
+            let submit = editor.clone();
+
             dialog
                 .title(if editing.is_some() {
                     "Edit camera"
                 } else {
                     "Add RTSP camera"
+                })
+                .entrance(DialogEntrance::SlideDown)
+                .overlay_closable(false)
+                .on_ok(move |_, window, cx| {
+                    submit.update(cx, |form, cx| {
+                        form.save(window, cx);
+                    });
+
+                    false
                 })
                 .child(editor.clone())
         });
@@ -224,6 +238,8 @@ impl CamerasView {
 
             dialog
                 .title("Remove camera?")
+                .entrance(DialogEntrance::SlideDown)
+                .on_ok(|_, _, _| false)
                 .child(format!(
                     "Remove '{name}' and disconnect its live stream? No changes will be made to the camera itself."
                 ))
@@ -262,6 +278,20 @@ impl CamerasView {
                                     );
 
                                     window.close_dialog(cx);
+
+                                    if !removed {
+                                        let error = catalog.read(cx)
+                                            .storage_error()
+                                            .map(str::to_owned);
+                                        if let Some(error) = error {
+                                            window.push_notification(
+                                                Notification::error(error)
+                                                    .autohide(false)
+                                                    .placement(Anchor::BottomRight),
+                                                cx,
+                                            );
+                                        }
+                                    }
 
                                     if removed {
                                         window.push_notification(
@@ -471,6 +501,7 @@ impl Render for CamerasView {
         let query = self.search.read(cx).value().to_lowercase();
 
         let configured = self.catalog.read(cx).all().to_vec();
+        let storage_error = self.catalog.read(cx).storage_error().map(str::to_owned);
 
         let configured_addresses = configured
             .iter()
@@ -613,6 +644,18 @@ impl Render for CamerasView {
                     .min_h_0()
                     .gap_3()
                     .p_4()
+                    .when_some(storage_error, |view, error| {
+                        view.child(
+                            div()
+                                .p_3()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(cx.theme().danger)
+                                .text_sm()
+                                .text_color(cx.theme().danger)
+                                .child(format!("Camera storage: {error}")),
+                        )
+                    })
                     .child(
                         Input::new(&self.search)
                             .cleanable(true),
@@ -782,6 +825,10 @@ struct CameraForm {
     address: Entity<InputState>,
     hint: Option<String>,
     error: Option<String>,
+    suggested_address: String,
+    probe_rx: Option<Receiver<Vec<Candidate>>>,
+    probe_cancel: Option<Arc<AtomicBool>>,
+    _probe_task: Option<Task<()>>,
 }
 
 impl CameraForm {
@@ -801,19 +848,22 @@ impl CameraForm {
 
         let suggested_address = discovered
             .as_ref()
-            .and_then(|device| {
-                device
-                    .rtsp_port()
-                    .map(|port| format!("rtsp://{}:{port}/", device.address))
+            .map(|device| {
+                let port = device.rtsp_port().unwrap_or(554);
+                if device.v380_advertised {
+                    format!("rtsp://{}:{port}/live/ch00_1", device.address)
+                } else {
+                    format!("rtsp://{}:{port}/", device.address)
+                }
             })
             .unwrap_or_default();
 
         let hint = discovered.as_ref().map(|device| {
-            if device.rtsp_port().is_some() {
-                "The RTSP address is a starting point only. Confirm the camera's actual stream path before saving."
+            if device.v380_advertised {
+                "Testing documented V380 main and substream paths. The suggested address is not yet verified."
                     .to_owned()
             } else {
-                "No standard RTSP port was detected. Enable RTSP on the camera or provide its supported stream URL. Proprietary V380 streaming is not yet implemented."
+                "Discovery does not reveal an RTSP path. Enter the camera's verified stream URL. ONVIF GetStreamUri is not yet supported."
                     .to_owned()
             }
         });
@@ -840,6 +890,41 @@ impl CameraForm {
                 )
         });
 
+        let mut probe_rx = None;
+        let mut probe_cancel = None;
+        let mut probe_task = None;
+
+        if let Some(device) = discovered.filter(|device| device.v380_advertised) {
+            let (tx, rx) = mpsc::channel();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let worker_cancel = Arc::clone(&cancel);
+            let ip = device.address;
+            let ports = device.open_ports;
+
+            thread::spawn(move || {
+                let result = rtsp_candidates::probe_v380(ip, &ports, &worker_cancel);
+                let _ = tx.send(result);
+            });
+
+            let task = cx.spawn_in(window, async move |weak, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(120))
+                        .await;
+
+                    match weak.update_in(cx, |form, window, cx| form.poll_probe(window, cx)) {
+                        Ok(true) => break,
+                        Ok(false) => (),
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            probe_rx = Some(rx);
+            probe_cancel = Some(cancel);
+            probe_task = Some(task);
+        }
+
         Self {
             catalog,
             editing,
@@ -847,7 +932,61 @@ impl CameraForm {
             address,
             hint,
             error: None,
+            suggested_address,
+            probe_rx,
+            probe_cancel,
+            _probe_task: probe_task,
         }
+    }
+
+    fn poll_probe(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(rx) = self.probe_rx.as_ref() else {
+            return true;
+        };
+
+        let candidates = match rx.try_recv() {
+            Ok(candidates) => candidates,
+            Err(mpsc::TryRecvError::Empty) => return false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.hint = Some(
+                    "The RTSP check could not finish. Confirm the stream URL manually.".into(),
+                );
+                self.probe_rx = None;
+                cx.notify();
+                return true;
+            }
+        };
+
+        if let Some(candidate) = rtsp_candidates::preferred(&candidates) {
+            let unchanged =
+                self.address.read(cx).value().as_ref() == self.suggested_address.as_str();
+            if unchanged {
+                self.address.update(cx, |field, cx| {
+                    field.set_value(candidate.url.clone(), window, cx);
+                });
+            }
+
+            self.hint = Some(match candidate.result {
+                ProbeResult::VideoSdpAccepted => {
+                    "The camera accepted RTSP DESCRIBE and advertised video. Actual playback will be checked when connected."
+                        .to_owned()
+                }
+                ProbeResult::AuthenticationRequired => {
+                    "RTSP authentication is required. Credential storage is not yet supported; supply an authorized credential-free stream."
+                        .to_owned()
+                }
+                ProbeResult::Rejected | ProbeResult::Indeterminate => {
+                    "No stream URL could be verified. The suggested V380 path may not work; confirm the camera's stream settings."
+                        .to_owned()
+                }
+            });
+        } else {
+            self.hint = Some("No V380 stream path responded. Enter the URL manually.".into());
+        }
+
+        self.probe_rx = None;
+        cx.notify();
+        true
     }
 
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -879,7 +1018,7 @@ impl CameraForm {
                     Notification::info(if editing.is_some() {
                         format!("Updated '{name}'. Connecting to stream...")
                     } else {
-                        format!("Added '{name}'. Connecting to stream...")
+                        format!("Saved '{name}'. Connecting to stream...")
                     })
                     .placement(Anchor::BottomRight),
                     cx,
@@ -890,6 +1029,14 @@ impl CameraForm {
                 self.error = Some(message);
                 cx.notify();
             }
+        }
+    }
+}
+
+impl Drop for CameraForm {
+    fn drop(&mut self) {
+        if let Some(cancel) = &self.probe_cancel {
+            cancel.store(true, Ordering::Relaxed);
         }
     }
 }

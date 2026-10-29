@@ -9,6 +9,8 @@ use std::{
 use gpui_kit::RenderImage;
 use stream::{StreamEvent, StreamSession};
 
+use crate::persistence::cameras::{self as camera_storage, SavedCamera};
+
 const INITIAL_RETRY_SECONDS: u64 = 2;
 const MAX_RETRY_SECONDS: u64 = 30;
 const CONNECT_TIMEOUT_SECONDS: u64 = 20;
@@ -70,15 +72,86 @@ pub struct CameraCatalog {
     records: Vec<Camera>,
     next_id: u64,
     sessions: HashMap<CameraId, StreamSession>,
+    storage_error: Option<String>,
+    load_error: Option<String>,
 }
 
 impl CameraCatalog {
     pub fn new() -> Self {
-        Self {
-            records: Vec::new(),
-            next_id: 1,
-            sessions: HashMap::new(),
+        match camera_storage::load() {
+            Ok(saved) => {
+                let next_id = saved
+                    .iter()
+                    .map(|camera| camera.id)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+
+                let records = saved
+                    .into_iter()
+                    .map(|saved| {
+                        Self::offline_camera(CameraId(saved.id), saved.name, saved.rtsp_address)
+                    })
+                    .collect();
+
+                Self {
+                    records,
+                    next_id,
+                    sessions: HashMap::new(),
+                    storage_error: None,
+                    load_error: None,
+                }
+            }
+            Err(message) => Self {
+                records: Vec::new(),
+                next_id: 1,
+                sessions: HashMap::new(),
+                storage_error: Some(message.clone()),
+                load_error: Some(message),
+            },
         }
+    }
+
+    fn offline_camera(id: CameraId, name: String, rtsp_address: String) -> Camera {
+        Camera {
+            id,
+            name,
+            rtsp_address,
+            connection: ConnectionState::Offline,
+            detail: None,
+            latest_frame: None,
+            frame_revision: 0,
+            last_frame_at: None,
+            started_at: None,
+            stable_since: None,
+            wants_connection: false,
+            retry_delay_seconds: INITIAL_RETRY_SECONDS,
+            next_retry_at: None,
+        }
+    }
+
+    /// A failed load blocks writes to avoid overwriting a damaged or unreadable file.
+    pub fn storage_error(&self) -> Option<&str> {
+        self.storage_error.as_deref()
+    }
+
+    fn save_records(&self, records: &[Camera]) -> Result<(), String> {
+        if let Some(error) = &self.load_error {
+            return Err(format!(
+                "Saved cameras could not be loaded ({error}). Fix or back up the file before editing cameras."
+            ));
+        }
+
+        let snapshot = records
+            .iter()
+            .map(|camera| SavedCamera {
+                id: camera.id.0,
+                name: camera.name.clone(),
+                rtsp_address: camera.rtsp_address.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        camera_storage::save(&snapshot)
     }
 
     pub fn all(&self) -> &[Camera] {
@@ -93,24 +166,26 @@ impl CameraCatalog {
         self.validate(None, name, address)?;
 
         let id = CameraId(self.next_id);
-        self.next_id += 1;
+        let following_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or("No camera IDs remain available")?;
 
-        self.records.push(Camera {
+        let mut proposed = self.records.clone();
+        proposed.push(Self::offline_camera(
             id,
-            name: name.trim().to_owned(),
-            rtsp_address: address.trim().to_owned(),
-            connection: ConnectionState::Offline,
-            detail: None,
-            latest_frame: None,
-            frame_revision: 0,
-            last_frame_at: None,
-            started_at: None,
-            stable_since: None,
-            wants_connection: false,
-            retry_delay_seconds: INITIAL_RETRY_SECONDS,
-            next_retry_at: None,
-        });
+            name.trim().to_owned(),
+            address.trim().to_owned(),
+        ));
 
+        if let Err(error) = self.save_records(&proposed) {
+            self.storage_error = Some(error.clone());
+            return Err(error);
+        }
+
+        self.storage_error = None;
+        self.records = proposed;
+        self.next_id = following_id;
         self.connect(id)?;
         Ok(id)
     }
@@ -121,10 +196,9 @@ impl CameraCatalog {
         }
 
         self.validate(Some(id), name, address)?;
-        self.disconnect(id);
 
-        let camera = self
-            .records
+        let mut proposed = self.records.clone();
+        let camera = proposed
             .iter_mut()
             .find(|camera| camera.id == id)
             .expect("camera exists");
@@ -132,17 +206,46 @@ impl CameraCatalog {
         camera.name = name.trim().to_owned();
         camera.rtsp_address = address.trim().to_owned();
 
+        if let Err(error) = self.save_records(&proposed) {
+            self.storage_error = Some(error.clone());
+            return Err(error);
+        }
+
+        self.storage_error = None;
+        self.disconnect(id);
+
+        let camera = self
+            .records
+            .iter_mut()
+            .find(|camera| camera.id == id)
+            .expect("camera exists");
+        camera.name = name.trim().to_owned();
+        camera.rtsp_address = address.trim().to_owned();
+
         self.connect(id)
     }
 
     pub fn remove(&mut self, id: CameraId) -> bool {
+        if self.get(id).is_none() {
+            return false;
+        }
+
+        let proposed = self
+            .records
+            .iter()
+            .filter(|camera| camera.id != id)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if let Err(error) = self.save_records(&proposed) {
+            self.storage_error = Some(error);
+            return false;
+        }
+
+        self.storage_error = None;
         self.disconnect(id);
-
-        let before = self.records.len();
-
         self.records.retain(|camera| camera.id != id);
-
-        before != self.records.len()
+        true
     }
 
     pub fn connect(&mut self, id: CameraId) -> Result<(), String> {
@@ -363,6 +466,12 @@ impl CameraCatalog {
     }
 }
 
+impl Drop for CameraCatalog {
+    fn drop(&mut self) {
+        self.sessions.clear();
+    }
+}
+
 impl Default for CameraCatalog {
     fn default() -> Self {
         Self::new()
@@ -374,9 +483,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_starts_empty() {
-        let catalog = CameraCatalog::new();
-        assert!(catalog.all().is_empty());
+    fn restored_camera_starts_disconnected() {
+        let camera = CameraCatalog::offline_camera(
+            CameraId(42),
+            "Driveway".into(),
+            "rtsp://192.168.1.20/live/ch00_1".into(),
+        );
+
+        assert_eq!(camera.connection, ConnectionState::Offline);
+        assert!(!camera.wants_connection);
+        assert!(camera.latest_frame.is_none());
     }
 
     #[test]

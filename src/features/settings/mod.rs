@@ -260,7 +260,7 @@ impl Palette {
                 0xffffff, 0x17202d, 0xf7f8fa, 0xf2f4f7, 0xe1e5eb, 0x697586, 0x3668c9,
             ),
             (_, true) => (
-                0x15191f, 0xf4f6fa, 0x1b2028, 0x242b35, 0x343d4b, 0xabb5c4, 0x91b5ff,
+                0x15191f, 0xf4f6fa, 0x1b2028, 0x242b35, 0x343d4b, 0xa6adb4, 0x91b5ff,
             ),
         };
 
@@ -535,7 +535,7 @@ impl Render for SettingsView {
                                         cx.theme().muted_foreground,
                                     )
                                     .child(
-                                        "Only installed themes compatible with the current appearance are shown. Camera configurations in this demo are not persisted.",
+                                        "Only installed themes compatible with the current appearance are shown. Saved cameras start disconnected when Vermouth launches.",
                                     ),
                             ),
                     ),
