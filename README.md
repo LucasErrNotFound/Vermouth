@@ -6,7 +6,7 @@
 
 *A secret makes a woman, woman*
 
-A native desktop workspace for CCTV and IP cameras, built with **Rust** and **GPUI-Kit**.
+A native desktop workspace for CCTV and IP cameras.
 
 [Overview](#overview) · [Showcase](#showcase) · [Themes](#themes) · [Getting started](#getting-started) · [Build from source](#build-from-source)
 
