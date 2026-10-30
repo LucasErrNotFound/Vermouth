@@ -92,6 +92,9 @@ impl AppShell {
 
     fn navigate(&mut self, page: Page, cx: &mut Context<Self>) {
         if self.page != page {
+            if page != Page::Live {
+                self.live.update(cx, |live, cx| live.stop_ptz_control(cx));
+            }
             self.page = page;
             cx.notify();
         }

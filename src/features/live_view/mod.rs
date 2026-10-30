@@ -1,13 +1,14 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
+    sync::mpsc::{Receiver, Sender},
     time::{Duration, Instant},
 };
 
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{Spring, spring};
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _,
     button::Button,
     menu::{ContextMenuExt as _, PopupMenuItem},
     notification::Notification,
@@ -20,6 +21,10 @@ use gpui_kit::*;
 pub mod layout;
 
 use crate::{
+    camera::ptz::{
+        self, Command as PtzCommand, Direction as PtzDirection, Event as PtzEvent,
+        Target as PtzTarget,
+    },
     camera::{Camera, CameraCatalog, CameraId, ConnectionState},
     features::cameras::CamerasView,
 };
@@ -31,6 +36,13 @@ const HEADER_HEIGHT: f32 = 40.0;
 const FOOTER_HEIGHT: f32 = 40.0;
 
 struct ReconnectNotice;
+
+#[derive(Clone)]
+enum PtzAvailability {
+    Checking,
+    Available(PtzTarget),
+    Unavailable(String),
+}
 
 #[derive(Clone)]
 struct CameraDrag {
@@ -54,6 +66,11 @@ pub struct LiveView {
     frames: HashMap<CameraId, (u64, Arc<RenderImage>)>,
     retired: VecDeque<(Instant, Arc<RenderImage>)>,
     pending_connections: HashMap<CameraId, String>,
+    ptz_states: HashMap<CameraId, PtzAvailability>,
+    ptz_sender: Sender<PtzCommand>,
+    ptz_receiver: Receiver<PtzEvent>,
+    ptz_active: Option<(CameraId, PtzDirection)>,
+    last_ptz_keepalive: Instant,
     _observer: Subscription,
     _poll_task: Task<()>,
 }
@@ -65,12 +82,14 @@ impl LiveView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let camera_order = catalog
+        let camera_order: Vec<CameraId> = catalog
             .read(cx)
             .all()
             .iter()
             .map(|camera| camera.id)
             .collect();
+
+        let initial_selection = camera_order.first().copied();
 
         let observer = cx.observe(&catalog, |view, catalog, cx| {
             let all = catalog.read(cx).all();
@@ -84,6 +103,8 @@ impl LiveView {
 
             cx.notify();
         });
+
+        let (ptz_sender, ptz_receiver) = ptz::spawn_worker();
 
         let task = cx.spawn_in(window, async move |weak, cx| {
             loop {
@@ -105,7 +126,7 @@ impl LiveView {
         Self {
             catalog,
             cameras_view,
-            selected: None,
+            selected: initial_selection,
             focused: false,
             inspector: true,
             navigation_collapsed: None,
@@ -113,6 +134,11 @@ impl LiveView {
             frames: HashMap::new(),
             retired: VecDeque::new(),
             pending_connections: HashMap::new(),
+            ptz_states: HashMap::new(),
+            ptz_sender,
+            ptz_receiver,
+            ptz_active: None,
+            last_ptz_keepalive: Instant::now(),
             _observer: observer,
             _poll_task: task,
         }
@@ -141,6 +167,32 @@ impl LiveView {
         let now = Instant::now();
 
         self.sync_camera_order(&cameras);
+        self.ptz_states.retain(|id, _| {
+            cameras
+                .iter()
+                .any(|camera| camera.id == *id && camera.connection == ConnectionState::Live)
+        });
+        if self.poll_ptz(cx) {
+            cx.notify();
+        }
+
+        let still_controllable = self.ptz_active.is_some_and(|(id, _)| {
+            window.is_window_active()
+                && self.inspector
+                && self.selected == Some(id)
+                && cameras
+                    .iter()
+                    .any(|camera| camera.id == id && camera.connection == ConnectionState::Live)
+        });
+
+        if !still_controllable {
+            self.stop_ptz_control(cx);
+        } else if self.last_ptz_keepalive.elapsed() >= Duration::from_millis(120)
+            && let Some((id, _)) = self.ptz_active
+        {
+            let _ = self.ptz_sender.send(PtzCommand::KeepAlive(id));
+            self.last_ptz_keepalive = Instant::now();
+        }
 
         let mut changed = false;
 
@@ -312,6 +364,88 @@ impl LiveView {
         );
     }
 
+    fn poll_ptz(&mut self, cx: &Context<Self>) -> bool {
+        let mut changed = false;
+        while let Ok(event) = self.ptz_receiver.try_recv() {
+            match event {
+                PtzEvent::Discovered(id, address, result) => {
+                    let valid = self.catalog.read(cx).get(id).is_some_and(|camera| {
+                        camera.rtsp_address == address && camera.connection == ConnectionState::Live
+                    });
+                    if !valid {
+                        continue;
+                    }
+                    self.ptz_states.insert(
+                        id,
+                        match result {
+                            Ok(target) => PtzAvailability::Available(target),
+                            Err(error) => PtzAvailability::Unavailable(error),
+                        },
+                    );
+                    changed = true;
+                }
+                PtzEvent::CommandFailed(id, error) => {
+                    changed = true;
+                    self.ptz_states
+                        .insert(id, PtzAvailability::Unavailable(error));
+                    if self
+                        .ptz_active
+                        .is_some_and(|(active_id, _)| active_id == id)
+                    {
+                        self.ptz_active = None;
+                        let _ = self.ptz_sender.send(PtzCommand::Stop(id));
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    fn detect_ptz(&mut self, id: CameraId, cx: &mut Context<Self>) {
+        let Some(camera) = self.catalog.read(cx).get(id) else {
+            return;
+        };
+        if camera.connection != ConnectionState::Live {
+            return;
+        }
+        let url = camera.rtsp_address.clone();
+        self.stop_ptz_control(cx);
+        self.ptz_states.insert(id, PtzAvailability::Checking);
+        let _ = self.ptz_sender.send(PtzCommand::Discover(id, url));
+        cx.notify();
+    }
+
+    fn begin_ptz(&mut self, id: CameraId, direction: PtzDirection, cx: &mut Context<Self>) {
+        let Some(PtzAvailability::Available(target)) = self.ptz_states.get(&id) else {
+            return;
+        };
+        if self.selected != Some(id)
+            || !self.inspector
+            || !self
+                .catalog
+                .read(cx)
+                .get(id)
+                .is_some_and(|camera| camera.connection == ConnectionState::Live)
+        {
+            return;
+        }
+        let target = target.clone();
+        self.stop_ptz_control(cx);
+        self.ptz_active = Some((id, direction));
+        self.last_ptz_keepalive = Instant::now();
+        let _ = self
+            .ptz_sender
+            .send(PtzCommand::Start(id, target, direction));
+        cx.notify();
+    }
+
+    pub(crate) fn stop_ptz_control(&mut self, cx: &mut Context<Self>) {
+        if let Some((id, _)) = self.ptz_active.take() {
+            let _ = self.ptz_sender.send(PtzCommand::Stop(id));
+            cx.notify();
+        }
+    }
+
     fn move_camera(&mut self, dragged: CameraId, destination: usize, cx: &mut Context<Self>) {
         let Some(source) = self.camera_order.iter().position(|id| *id == dragged) else {
             return;
@@ -366,6 +500,7 @@ impl LiveView {
 
     fn select(&mut self, id: CameraId, cx: &mut Context<Self>) {
         if self.selected != Some(id) {
+            self.stop_ptz_control(cx);
             self.selected = Some(id);
             cx.notify();
         }
@@ -480,6 +615,7 @@ impl LiveView {
 
         let context_menu = div()
             .id(format!("camera-content-{}", id.0))
+            .cursor_pointer()
             .flex()
             .flex_col()
             .on_mouse_down(
@@ -622,8 +758,7 @@ impl LiveView {
 
         let header = if allow_drag {
             header
-                .cursor_crosshair()
-                .active(|style| style.cursor_crosshair())
+                .cursor_pointer()
                 .tooltip(|window, cx| Tooltip::new("Drag to rearrange cameras").build(window, cx))
                 .on_drag(drag_payload, move |drag, _, _, cx| {
                     let _ = weak_drag.update(cx, |view, cx| {
@@ -638,7 +773,6 @@ impl LiveView {
 
         div()
             .id(format!("camera-tile-{}", id.0))
-            .cursor_pointer()
             .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
             .on_click(cx.listener(move |view, _, _, cx| {
                 view.select(id, cx);
@@ -656,7 +790,137 @@ impl LiveView {
             .into_any_element()
     }
 
-    fn inspector(&self, camera: &Camera, cx: &Context<Self>) -> AnyElement {
+    fn ptz_direction(
+        &self,
+        id: CameraId,
+        direction: PtzDirection,
+        icon: IconName,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let ready = matches!(
+            self.ptz_states.get(&id),
+            Some(PtzAvailability::Available(_))
+        );
+        let held = self.ptz_active == Some((id, direction));
+        let border = cx.theme().border;
+        let background = if held {
+            cx.theme().accent
+        } else {
+            cx.theme().secondary
+        };
+        div()
+            .id(format!("ptz-{}-{direction:?}", id.0))
+            .w(px(43.))
+            .h(px(38.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .border_1()
+            .border_color(border)
+            .bg(background)
+            .when(ready, |button| {
+                button
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, _, _, cx| {
+                            view.begin_ptz(id, direction, cx);
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|view, _, _, cx| {
+                            view.stop_ptz_control(cx);
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|view, _, _, cx| {
+                            view.stop_ptz_control(cx);
+                        }),
+                    )
+            })
+            .child(Icon::new(icon).small().text_color(if ready {
+                cx.theme().foreground
+            } else {
+                cx.theme().muted_foreground
+            }))
+            .into_any_element()
+    }
+
+    fn ptz_controls(&self, camera: &Camera, cx: &mut Context<Self>) -> AnyElement {
+        let id = camera.id;
+        let live = camera.connection == ConnectionState::Live;
+        let state = self.ptz_states.get(&id);
+        let ready = live && matches!(state, Some(PtzAvailability::Available(_)));
+        let status = if !live {
+            "Connect the camera to detect PTZ support".to_owned()
+        } else {
+            match state {
+                None => "PTZ capabilities have not been checked".to_owned(),
+                Some(PtzAvailability::Checking) => "Checking ONVIF PTZ capabilities...".to_owned(),
+                Some(PtzAvailability::Available(_)) => {
+                    "ONVIF PTZ available · hold an arrow to move".to_owned()
+                }
+                Some(PtzAvailability::Unavailable(error)) => error.clone(),
+            }
+        };
+
+        let controls = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .items_center()
+            .child(self.ptz_direction(id, PtzDirection::Up, IconName::ChevronUp, cx))
+            .child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(self.ptz_direction(id, PtzDirection::Left, IconName::ChevronLeft, cx))
+                    .child(
+                        Button::new(format!("ptz-stop-{}", id.0))
+                            .icon(IconName::Square)
+                            .tooltip("Stop camera movement")
+                            .disabled(!ready)
+                            .on_click(cx.listener(|view, _, _, cx| view.stop_ptz_control(cx))),
+                    )
+                    .child(self.ptz_direction(id, PtzDirection::Right, IconName::ChevronRight, cx)),
+            )
+            .child(self.ptz_direction(id, PtzDirection::Down, IconName::ChevronDown, cx));
+
+        div()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .pt_3()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Camera controls"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(status),
+            )
+            .child(
+                Button::new(format!("ptz-detect-{}", id.0))
+                    .icon(IconName::Search)
+                    .label("Detect ONVIF PTZ")
+                    .disabled(!live || matches!(state, Some(PtzAvailability::Checking)))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |view, _, _, cx| view.detect_ptz(id, cx))),
+            )
+            .when(ready, |panel| panel.child(controls))
+            .into_any_element()
+    }
+
+    fn inspector(&self, camera: &Camera, cx: &mut Context<Self>) -> AnyElement {
         div()
             .flex()
             .flex_col()
@@ -680,7 +944,7 @@ impl LiveView {
             )
             .child(Self::status(camera, cx))
             .child(info_row("Transport", "RTSP / TCP", cx))
-            .child(info_row("PTZ", "Not available", cx))
+            .child(self.ptz_controls(camera, cx))
             .child(
                 div()
                     .text_sm()
@@ -694,7 +958,7 @@ impl LiveView {
                     .pt_3()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("No recording, audio, ONVIF or PTZ in this release."),
+                    .child("No recording or audio in this release. PTZ requires an authorized ONVIF service."),
             )
             .into_any_element()
     }
@@ -906,6 +1170,9 @@ impl Render for LiveView {
             .min_h_0()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            .on_mouse_up(MouseButton::Left, cx.listener(|view, _, _, cx| {
+                view.stop_ptz_control(cx);
+            }))
             .child(
                 div()
                     .flex()
@@ -980,6 +1247,7 @@ impl Render for LiveView {
                                     )
                                     .on_click(cx.listener(
                                         |view, _, _, cx| {
+                                            view.stop_ptz_control(cx);
                                             view.inspector =
                                                 !view.inspector;
                                             cx.notify();
@@ -1067,7 +1335,7 @@ impl Render for LiveView {
                         div()
                             .px_3()
                             .pb_3()
-                            .max_h(px(220.))
+                            .max_h(px(390.))
                             .id("compact-inspector-scroll")
                             .overflow_y_scroll()
                             .children(
@@ -1080,5 +1348,11 @@ impl Render for LiveView {
                     )
                 },
             )
+    }
+}
+
+impl Drop for LiveView {
+    fn drop(&mut self) {
+        let _ = self.ptz_sender.send(PtzCommand::Shutdown);
     }
 }

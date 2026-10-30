@@ -1,3 +1,4 @@
+pub mod ptz;
 mod stream;
 
 use std::{
