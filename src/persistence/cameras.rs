@@ -37,7 +37,7 @@ pub fn camera_file_path() -> Result<PathBuf, String> {
     }
     .ok_or_else(|| "Could not determine the user's configuration directory".to_string())?;
 
-    Ok(base.join("vermouth-frontend").join("cameras.json"))
+    Ok(base.join("Vermouth").join("cameras.json"))
 }
 
 pub fn load() -> Result<Vec<SavedCamera>, String> {

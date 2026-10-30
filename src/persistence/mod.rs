@@ -267,12 +267,12 @@ fn pref_path() -> Option<PathBuf> {
     if cfg!(windows) {
         env::var_os("APPDATA")
             .map(PathBuf::from)
-            .map(|path| path.join("vermouth-frontend").join("preferences.conf"))
+            .map(|path| path.join("Vermouth").join("preferences.conf"))
     } else {
         env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-            .map(|path| path.join("vermouth-frontend").join("preferences.conf"))
+            .map(|path| path.join("Vermouth").join("preferences.conf"))
     }
 }
 
