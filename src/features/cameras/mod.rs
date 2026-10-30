@@ -223,6 +223,47 @@ impl CamerasView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        fn remove_camera(
+            catalog: &Entity<CameraCatalog>,
+            id: CameraId,
+            name: &str,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> bool {
+            let removed = catalog.update(cx, |store, cx| {
+                let removed = store.remove(id);
+
+                if removed {
+                    cx.notify();
+                }
+
+                removed
+            });
+
+            if removed {
+                window.push_notification(
+                    Notification::success(format!("Removed '{name}'."))
+                        .placement(Anchor::BottomRight),
+                    cx,
+                );
+            } else {
+                let error = catalog
+                    .read(cx)
+                    .storage_error()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "The camera could not be removed.".to_owned());
+
+                window.push_notification(
+                    Notification::error(error)
+                        .autohide(false)
+                        .placement(Anchor::BottomRight),
+                    cx,
+                );
+            }
+
+            removed
+        }
+
         let name = self
             .catalog
             .read(cx)
@@ -233,15 +274,24 @@ impl CamerasView {
         let catalog = self.catalog.clone();
 
         window.open_dialog(cx, move |dialog, _, _| {
-            let catalog = catalog.clone();
-            let notice = name.clone();
+            let enter_catalog = catalog.clone();
+            let button_catalog = catalog.clone();
+
+            let enter_name = name.clone();
+            let button_name = name.clone();
 
             dialog
                 .title("Remove camera?")
-                .entrance(DialogEntrance::SlideDown)
-                .on_ok(|_, _, _| false)
+                .entrance(DialogEntrance::FadeSlide)
+                .overlay_closable(false)
+                .on_ok(move |_, window, cx| {
+                    // Return true to close the dialog after
+                    // successfully removing the camera.
+                    remove_camera(&enter_catalog, id, &enter_name, window, cx)
+                })
                 .child(format!(
-                    "Remove '{name}' and disconnect its live stream? No changes will be made to the camera itself."
+                    "Remove '{name}' and disconnect its live stream? \
+                 No changes will be made to the camera itself."
                 ))
                 .footer(
                     div()
@@ -263,48 +313,9 @@ impl CamerasView {
                                 .label("Remove")
                                 .cursor_pointer()
                                 .on_click(move |_, window, cx| {
-                                    let removed = catalog.update(
-                                        cx,
-                                        |store, cx| {
-                                            let removed =
-                                                store.remove(id);
-
-                                            if removed {
-                                                cx.notify();
-                                            }
-
-                                            removed
-                                        },
-                                    );
-
-                                    window.close_dialog(cx);
-
-                                    if !removed {
-                                        let error = catalog.read(cx)
-                                            .storage_error()
-                                            .map(str::to_owned);
-                                        if let Some(error) = error {
-                                            window.push_notification(
-                                                Notification::error(error)
-                                                    .autohide(false)
-                                                    .placement(Anchor::BottomRight),
-                                                cx,
-                                            );
-                                        }
-                                    }
-
-                                    if removed {
-                                        window.push_notification(
-                                            Notification::success(
-                                                format!(
-                                                    "Removed '{notice}'."
-                                                ),
-                                            )
-                                            .placement(
-                                                Anchor::BottomRight,
-                                            ),
-                                            cx,
-                                        );
+                                    if remove_camera(&button_catalog, id, &button_name, window, cx)
+                                    {
+                                        window.close_dialog(cx);
                                     }
                                 }),
                         ),
