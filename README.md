@@ -1,8 +1,6 @@
 <div align="center">
 
-<!-- Add your actual logo before uncommenting this line.
-<img src="docs/images/vermouth.png" alt="Vermouth logo" width="256" />
--->
+<img src="docs/images/Vermouth.png" alt="Vermouth logo" width="256" />
 
 # Vermouth
 
