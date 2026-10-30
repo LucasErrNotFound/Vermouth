@@ -5,11 +5,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gpui_kit::assets::IconName;
+use gpui_kit::{assets::IconName, component::dialog::DialogEntrance};
 use gpui_kit::base::{Spring, spring};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _,
-    button::Button,
+    button::{Button, ButtonVariants as _},
+    input::{Input, InputContentType, InputState},
     menu::{ContextMenuExt as _, PopupMenuItem},
     notification::Notification,
     spinner::Spinner,
@@ -22,8 +23,8 @@ pub mod layout;
 
 use crate::{
     camera::ptz::{
-        self, Command as PtzCommand, Direction as PtzDirection, Event as PtzEvent,
-        Target as PtzTarget,
+        self, Command as PtzCommand, Credentials as PtzCredentials, Direction as PtzDirection,
+        Event as PtzEvent, Target as PtzTarget,
     },
     camera::{Camera, CameraCatalog, CameraId, ConnectionState},
     features::cameras::CamerasView,
@@ -402,6 +403,15 @@ impl LiveView {
     }
 
     fn detect_ptz(&mut self, id: CameraId, cx: &mut Context<Self>) {
+        self.detect_ptz_with_credentials(id, None, cx);
+    }
+
+    fn detect_ptz_with_credentials(
+        &mut self,
+        id: CameraId,
+        credentials: Option<Arc<PtzCredentials>>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(camera) = self.catalog.read(cx).get(id) else {
             return;
         };
@@ -411,8 +421,27 @@ impl LiveView {
         let url = camera.rtsp_address.clone();
         self.stop_ptz_control(cx);
         self.ptz_states.insert(id, PtzAvailability::Checking);
-        let _ = self.ptz_sender.send(PtzCommand::Discover(id, url));
+        let _ = self
+            .ptz_sender
+            .send(PtzCommand::Discover(id, url, credentials));
         cx.notify();
+    }
+
+    fn open_ptz_sign_in(&mut self, id: CameraId, window: &mut Window, cx: &mut Context<Self>) {
+        let weak = cx.weak_entity();
+        let form = cx.new(|cx| PtzSignIn::new(weak, id, window, cx));
+        window.open_dialog(cx, move |dialog, _, _| {
+            let submit = form.clone();
+            dialog
+                .title("ONVIF camera sign-in")
+                .entrance(DialogEntrance::SlideDown)
+                .overlay_closable(false)
+                .on_ok(move |_, window, cx| {
+                    submit.update(cx, |form, cx| form.submit(window, cx));
+                    false
+                })
+                .child(form.clone())
+        });
     }
 
     fn begin_ptz(&mut self, id: CameraId, direction: PtzDirection, cx: &mut Context<Self>) {
@@ -896,26 +925,25 @@ impl LiveView {
             .flex()
             .flex_col()
             .gap_2()
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Camera controls"),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(status),
-            )
-            .child(
-                Button::new(format!("ptz-detect-{}", id.0))
-                    .icon(IconName::Search)
-                    .label("Detect ONVIF PTZ")
-                    .disabled(!live || matches!(state, Some(PtzAvailability::Checking)))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |view, _, _, cx| view.detect_ptz(id, cx))),
-            )
+            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Camera controls"))
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(status))
+            .child(Button::new(format!("ptz-detect-{}", id.0))
+                .icon(IconName::Search)
+                .label("Detect ONVIF PTZ")
+                .disabled(!live || matches!(state, Some(PtzAvailability::Checking)))
+                .cursor_pointer()
+                .on_click(cx.listener(move |view, _, _, cx| view.detect_ptz(id, cx))))
+            .child(Button::new(format!("ptz-signin-{}", id.0))
+                .icon(IconName::Lock)
+                .label("ONVIF sign-in")
+                .disabled(!live || matches!(state, Some(PtzAvailability::Checking)))
+                .cursor_pointer()
+                .tooltip("Use authorized camera credentials for this session only")
+                .on_click(cx.listener(move |view, _, window, cx| {
+                    view.open_ptz_sign_in(id, window, cx);
+                })))
+            .child(div().text_xs().text_color(cx.theme().muted_foreground)
+                .child("WS-Discovery checks the actual service URL. Sign-in credentials are not saved."))
             .when(ready, |panel| panel.child(controls))
             .into_any_element()
     }
@@ -961,6 +989,84 @@ impl LiveView {
                     .child("No recording or audio in this release. PTZ requires an authorized ONVIF service."),
             )
             .into_any_element()
+    }
+}
+
+struct PtzSignIn {
+    live: WeakEntity<LiveView>,
+    camera_id: CameraId,
+    username: Entity<InputState>,
+    password: Entity<InputState>,
+    error: Option<String>,
+}
+
+impl PtzSignIn {
+    fn new(
+        live: WeakEntity<LiveView>,
+        camera_id: CameraId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let username = cx.new(|cx| InputState::new(window, cx).placeholder("ONVIF username"));
+        let password = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("ONVIF password")
+                .masked(true)
+        });
+        Self {
+            live,
+            camera_id,
+            username,
+            password,
+            error: None,
+        }
+    }
+
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let username = self.username.read(cx).value().to_string();
+        let password = self.password.read(cx).value().to_string();
+        match PtzCredentials::new(username, password) {
+            Ok(credentials) => {
+                let id = self.camera_id;
+                let result = self.live.update(cx, |view, cx| {
+                    view.detect_ptz_with_credentials(id, Some(Arc::new(credentials)), cx);
+                });
+                if result.is_ok() {
+                    window.close_dialog(cx);
+                } else {
+                    self.error = Some("The selected camera is no longer available".into());
+                    cx.notify();
+                }
+            }
+            Err(message) => {
+                self.error = Some(message);
+                cx.notify();
+            }
+        }
+    }
+}
+
+impl Render for PtzSignIn {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div().w_full().flex().flex_col().gap_3()
+            .child(div().text_sm().text_color(cx.theme().muted_foreground)
+                .child("Enter credentials supplied by the camera owner. They are kept only in memory for this session and are never added to camera JSON."))
+            .child(div().flex().flex_col().gap_1()
+                .child(div().text_sm().child("Username"))
+                .child(Input::new(&self.username)))
+            .child(div().flex().flex_col().gap_1()
+                .child(div().text_sm().child("Password"))
+                .child(Input::new(&self.password).content_type(InputContentType::Password)))
+            .when_some(self.error.clone(), |form, error| {
+                form.child(div().text_sm().text_color(cx.theme().danger).child(error))
+            })
+            .child(div().flex().justify_end().gap_2()
+                .child(Button::new("ptz-login-cancel")
+                    .label("Cancel").cursor_pointer()
+                    .on_click(|_, window, cx| window.close_dialog(cx)))
+                .child(Button::new("ptz-login-submit")
+                    .primary().label("Authenticate & detect").cursor_pointer()
+                    .on_click(cx.listener(|form, _, window, cx| form.submit(window, cx)))))
     }
 }
 
