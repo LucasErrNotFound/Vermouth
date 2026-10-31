@@ -1,9 +1,10 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod app;
 mod app_assets;
 mod camera;
 mod features;
 mod persistence;
-#[cfg(target_os = "windows")]
 mod single_instance;
 
 fn main() {
