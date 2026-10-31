@@ -6955,6 +6955,7 @@ dependencies = [
  "sha1",
  "sha2 0.11.1",
  "smallvec",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
