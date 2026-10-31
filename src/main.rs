@@ -4,6 +4,7 @@
 )]
 
 mod app;
+mod app_assets;
 mod camera;
 mod features;
 mod persistence;

@@ -1,4 +1,5 @@
 use gpui_kit::assets::IconName;
+use gpui_kit::base::h_flex;
 use gpui_kit::prelude::FluentBuilder as _;
 
 use gpui_kit::component::{
@@ -15,6 +16,8 @@ use gpui_kit::component::{
     tooltip::Tooltip,
 };
 use gpui_kit::*;
+
+use crate::app_assets::APP_ICON_PATH;
 
 use crate::{
     camera::CameraCatalog,
@@ -428,29 +431,19 @@ impl Render for AppShell {
                     .bg(cx.theme().sidebar)
                     .border_color(cx.theme().border)
                     .child(
-                        div()
-                            .flex()
+                        h_flex()
                             .items_center()
                             .gap_2()
-                            .min_w_0()
                             .child(
-                                div()
-                                    .w(px(22.))
-                                    .h(px(22.))
-                                    .rounded_md()
-                                    .bg(cx.theme().primary)
-                                    .text_color(cx.theme().background)
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(Icon::new(IconName::Video).small()),
+                                img(APP_ICON_PATH)
+                                    .w(px(26.))
+                                    .h(px(26.))
+                                    .flex_shrink_0()
+                                    .object_fit(ObjectFit::Contain),
                             )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Vermouth"),
-                            ),
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Vermouth"),
                     )
                     .child(
                         div()

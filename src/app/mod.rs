@@ -100,18 +100,20 @@ fn register_embedded_themes(cx: &mut App) {
 }
 
 pub fn run() {
-    application().with_assets(assets::AllAssets).run(|cx| {
-        init(cx);
+    application()
+        .with_assets(crate::app_assets::AppAssets)
+        .run(|cx| {
+            init(cx);
 
-        register_embedded_themes(cx);
+            register_embedded_themes(cx);
 
-        let preferences = Preferences::load();
+            let preferences = Preferences::load();
 
-        SettingsView::apply(preferences, None, cx);
+            SettingsView::apply(preferences, None, cx);
 
-        open_window(TitleBar::window_options(), cx, |window, cx| {
-            cx.new(|cx| shell::AppShell::new(preferences, window, cx))
-        })
-        .expect("Could not open native Vermouth window");
-    });
+            open_window(TitleBar::window_options(), cx, |window, cx| {
+                cx.new(|cx| shell::AppShell::new(preferences, window, cx))
+            })
+            .expect("Could not open native Vermouth window");
+        });
 }
