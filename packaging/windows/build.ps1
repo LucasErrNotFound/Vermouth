@@ -92,11 +92,8 @@ try {
     if ([string]::IsNullOrWhiteSpace($publisher) -or $publisher -match '["\x00-\x1f\x7f]') {
         throw 'package.authors[0] must be a nonempty publisher without quotes/control characters.'
     }
-
-    $description = [string]$package.description
-    if ([string]::IsNullOrWhiteSpace($description)) {
-        $description = 'Vermouth native CCTV camera client'
-    }
+	
+	$description = 'Vermouth'
 
     $repoUrl = [string]$package.repository
     if ($repoUrl -match '["\x00-\x1f\x7f]') {

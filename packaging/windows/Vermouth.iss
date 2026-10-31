@@ -1,3 +1,4 @@
+
 ; Vermouth Windows installer (Inno Setup 6.3+).
 ; Variables are supplied by packaging/windows/build.ps1.
 #ifndef AppVersion
@@ -43,7 +44,7 @@ OutputBaseFilename=Vermouth-{#AppVersion}-windows-x64-Setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
-SetupIconFile={#AppRoot}\assets\icons\vermouth.ico
+SetupIconFile={#AppRoot}\assets\icons\Vermouth.ico
 UninstallDisplayIcon={app}\{#AppExeName}
 CloseApplications=yes
 RestartApplications=no
@@ -77,22 +78,70 @@ Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Description: "Launch {#App
 
 [Code]
 // The application registers its own current-user Run entry when enabled.
-// Remove that entry on uninstall only if it points to THIS installation.
-procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+// Remove that entry only if it points to THIS installation.
+// AppData is intentionally retained unless the user explicitly opts in.
+
+var
+  RemoveUserData: Boolean;
+
+procedure RemoveApplicationData(const Folder: String);
+begin
+  if DirExists(Folder) then
+  begin
+    if not DelTree(Folder, True, True, True) then
+    begin
+      MsgBox(
+        'Vermouth could not completely delete this folder:' + #13#10 +
+        Folder + #13#10#13#10 +
+        'Close any applications using it, then remove the remaining ' +
+        'files manually if desired.',
+        mbError, MB_OK);
+    end;
+  end;
+end;
+
+procedure RemoveStartupRegistration();
 var
   ExistingCommand: String;
   InstalledCommand: String;
 begin
+  InstalledCommand := '"' + ExpandConstant('{app}\{#AppExeName}') + '"';
+  if RegQueryStringValue(HKCU64,
+    'Software\Microsoft\Windows\CurrentVersion\Run',
+    'Vermouth', ExistingCommand) then
+  begin
+    if CompareText(ExistingCommand, InstalledCommand) = 0 then
+      RegDeleteValue(HKCU64,
+        'Software\Microsoft\Windows\CurrentVersion\Run', 'Vermouth');
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
   if CurUninstallStep = usUninstall then
   begin
-    InstalledCommand := '"' + ExpandConstant('{app}\{#AppExeName}') + '"';
-    if RegQueryStringValue(HKCU64,
-      'Software\Microsoft\Windows\CurrentVersion\Run',
-      'Vermouth', ExistingCommand) then
+    // Executed after the standard uninstall confirmation.
+    // "No" retains personal data but does NOT cancel the uninstallation.
+    RemoveUserData :=
+      MsgBox(
+        'Also remove Vermouth''s local application data?' + #13#10#13#10 +
+        'Yes: Delete Vermouth settings, saved camera configurations, ' +
+        'and caches stored in Vermouth-owned AppData folders.' + #13#10 +
+        'No: Keep those files for a future installation.' + #13#10#13#10 +
+        'Recordings or exports saved elsewhere will not be deleted.',
+        mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES;
+
+    RemoveStartupRegistration();
+  end
+  else if CurUninstallStep = usPostUninstall then
+  begin
+    if RemoveUserData then
     begin
-      if CompareText(ExistingCommand, InstalledCommand) = 0 then
-        RegDeleteValue(HKCU64,
-          'Software\Microsoft\Windows\CurrentVersion\Run', 'Vermouth');
+      // Roaming AppData, current Vermouth storage location.
+      RemoveApplicationData(ExpandConstant('{userappdata}\Vermouth'));
+
+      // Local AppData for Vermouth-specific caches/settings, if present.
+      RemoveApplicationData(ExpandConstant('{localappdata}\Vermouth'));
     end;
   end;
 end;
