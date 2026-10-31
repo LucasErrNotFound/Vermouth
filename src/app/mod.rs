@@ -112,6 +112,8 @@ pub fn run() {
             SettingsView::apply(preferences, None, cx);
 
             open_window(TitleBar::window_options(), cx, |window, cx| {
+                window.set_window_title("Vermouth");
+
                 cx.new(|cx| shell::AppShell::new(preferences, window, cx))
             })
             .expect("Could not open native Vermouth window");
