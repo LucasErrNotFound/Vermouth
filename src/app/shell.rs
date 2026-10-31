@@ -1,12 +1,11 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::base::h_flex;
+use gpui_kit::component::TitleBar;
 use gpui_kit::prelude::FluentBuilder as _;
 
 use gpui_kit::component::{
     ActiveTheme as _, Collapsible as _, Disableable as _, Icon, Selectable as _, Sizable as _,
-    TitleBar, WindowExt as _,
     button::{Button, ButtonVariants as _},
-    notification::Notification,
     popover::Popover,
     scroll::ScrollableElement as _,
     sidebar::{
@@ -27,6 +26,8 @@ use crate::{
     },
     persistence::{Appearance, Preferences, ThemeFamily},
 };
+
+const GITHUB_REPOSITORY_URL: &str = "https://github.com/LucasErrNotFound/Vermouth";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -418,6 +419,50 @@ impl Render for AppShell {
             Page::Settings => self.settings.clone().into_any_element(),
         };
 
+        let titlebar = TitleBar::new()
+            .bg(cx.theme().sidebar)
+            .border_color(cx.theme().border)
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        img(APP_ICON_PATH)
+                            .w(px(26.))
+                            .h(px(26.))
+                            .flex_shrink_0()
+                            .object_fit(ObjectFit::Contain),
+                    )
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Vermouth"),
+            )
+            .child(div().flex_1())
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(self.settings_menu(cx))
+                    .child(
+                        div()
+                            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                window.prevent_default();
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                Button::new("titlebar-github")
+                                    .ghost()
+                                    .cursor_pointer()
+                                    .icon(IconName::Github)
+                                    .accessibility_label("Open Vermouth on GitHub")
+                                    .tooltip("Open the Vermouth repository on GitHub")
+                                    .on_click(|_, _, cx| {
+                                        cx.open_url(GITHUB_REPOSITORY_URL);
+                                    }),
+                            ),
+                    ),
+            );
+
         div()
             .flex()
             .flex_col()
@@ -426,49 +471,7 @@ impl Render for AppShell {
             .min_w_0()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .child(
-                TitleBar::new()
-                    .bg(cx.theme().sidebar)
-                    .border_color(cx.theme().border)
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                img(APP_ICON_PATH)
-                                    .w(px(26.))
-                                    .h(px(26.))
-                                    .flex_shrink_0()
-                                    .object_fit(ObjectFit::Contain),
-                            )
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Vermouth"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(self.settings_menu(cx))
-                            .child(
-                                Button::new("titlebar-github")
-                                    .ghost()
-                                    .icon(IconName::Github)
-                                    .cursor_pointer()
-                                    .tooltip("GitHub repository URL has not been configured")
-                                    .on_click(|_, window, cx| {
-                                        window.push_notification(
-                                            Notification::info(
-                                                "GitHub repository URL is not set yet.",
-                                            )
-                                            .placement(Anchor::BottomRight),
-                                            cx,
-                                        );
-                                    }),
-                            ),
-                    ),
-            )
+            .child(titlebar)
             .child(
                 div()
                     .flex()
