@@ -240,8 +240,6 @@ Vermouth follows a feature-oriented Rust application structure. The native shell
 | `assets/` | Icons and bundled appearance resources. |
 | `docs/` | Project specifications, security guidance, architecture, and testing notes. |
 
-For implementation details, see [the documentation index](docs/README.md), [architecture notes](docs/ARCHITECTURE.md), [camera protocol notes](docs/CAMERA_PROTOCOLS.md), and [security/privacy baseline](docs/SECURITY_PRIVACY.md).
-
 ### Code quality
 
 Run the project's checks from the repository root:
