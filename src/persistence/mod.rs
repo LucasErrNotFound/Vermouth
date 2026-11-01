@@ -1,4 +1,5 @@
 pub mod cameras;
+pub mod theme_catalog;
 
 use std::{env, fs, io, path::PathBuf};
 
@@ -28,190 +29,142 @@ impl Appearance {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ThemeFamily {
-    #[default]
-    Default,
-    Adventure,
-    Alduin,
-    Ascinema,
-    Aurora,
-    Ayu,
-    Catppuccin,
-    Everforest,
-    Fahrenheit,
-    Flexoki,
-    Gruvbox,
-    Harper,
-    Hybrid,
-    Jellybeans,
-    Kibble,
-    MacosClassic,
-    Mellifluous,
-    Molokai,
-    Solarized,
-    Spaceduck,
-    Tokyonight,
-    Twilight,
-    Graphite,
-}
-
-impl ThemeFamily {
-    pub const ALL: [Self; 23] = [
-        Self::Default,
-        Self::Adventure,
-        Self::Alduin,
-        Self::Ascinema,
-        Self::Aurora,
-        Self::Ayu,
-        Self::Catppuccin,
-        Self::Everforest,
-        Self::Fahrenheit,
-        Self::Flexoki,
-        Self::Gruvbox,
-        Self::Harper,
-        Self::Hybrid,
-        Self::Jellybeans,
-        Self::Kibble,
-        Self::MacosClassic,
-        Self::Mellifluous,
-        Self::Molokai,
-        Self::Solarized,
-        Self::Spaceduck,
-        Self::Tokyonight,
-        Self::Twilight,
-        Self::Graphite,
-    ];
-
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Default => "Default",
-            Self::Adventure => "Adventure",
-            Self::Alduin => "Alduin",
-            Self::Ascinema => "Ascinema",
-            Self::Aurora => "Aurora",
-            Self::Ayu => "Ayu",
-            Self::Catppuccin => "Catppuccin",
-            Self::Everforest => "Everforest",
-            Self::Fahrenheit => "Fahrenheit",
-            Self::Flexoki => "Flexoki",
-            Self::Gruvbox => "Gruvbox",
-            Self::Harper => "Harper",
-            Self::Hybrid => "Hybrid",
-            Self::Jellybeans => "Jellybeans",
-            Self::Kibble => "Kibble",
-            Self::MacosClassic => "macOS Classic",
-            Self::Mellifluous => "Mellifluous",
-            Self::Molokai => "Molokai",
-            Self::Solarized => "Solarized",
-            Self::Spaceduck => "Spaceduck",
-            Self::Tokyonight => "Tokyo Night",
-            Self::Twilight => "Twilight",
-            Self::Graphite => "Graphite",
-        }
-    }
-
-    const fn raw(self) -> &'static str {
-        match self {
-            Self::Default => "default",
-            Self::Adventure => "adventure",
-            Self::Alduin => "alduin",
-            Self::Ascinema => "ascinema",
-            Self::Aurora => "aurora",
-            Self::Ayu => "ayu",
-            Self::Catppuccin => "catppuccin",
-            Self::Everforest => "everforest",
-            Self::Fahrenheit => "fahrenheit",
-            Self::Flexoki => "flexoki",
-            Self::Gruvbox => "gruvbox",
-            Self::Harper => "harper",
-            Self::Hybrid => "hybrid",
-            Self::Jellybeans => "jellybeans",
-            Self::Kibble => "kibble",
-            Self::MacosClassic => "macos-classic",
-            Self::Mellifluous => "mellifluous",
-            Self::Molokai => "molokai",
-            Self::Solarized => "solarized",
-            Self::Spaceduck => "spaceduck",
-            Self::Tokyonight => "tokyonight",
-            Self::Twilight => "twilight",
-            Self::Graphite => "graphite",
-        }
-    }
-
-    fn from_raw(value: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|family| family.raw() == value)
-    }
-
-    pub fn variant_name(self, dark: bool) -> String {
-        format!("{} {}", self.name(), if dark { "Dark" } else { "Light" })
-    }
-
-    pub const fn has_local_palette(self) -> bool {
-        matches!(
-            self,
-            Self::Default | Self::Gruvbox | Self::Catppuccin | Self::Ayu | Self::Graphite
-        )
-    }
-
-    pub fn matches_registry_name(self, name: &str, dark: bool) -> bool {
-        let key = name
-            .to_ascii_lowercase()
-            .chars()
-            .filter(|ch| ch.is_ascii_alphanumeric())
-            .collect::<String>();
-
-        let prefix = self
-            .raw()
-            .chars()
-            .filter(|ch| ch.is_ascii_alphanumeric())
-            .collect::<String>();
-
-        if self == Self::Catppuccin {
-            return if dark {
-                key == "catppuccinmocha" || key == "catppuccindark"
-            } else {
-                key == "catppuccinlatte" || key == "catppuccinlight"
-            };
-        }
-
-        key == format!("{}{}", prefix, if dark { "dark" } else { "light" })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Preferences {
     pub appearance: Appearance,
-    pub family: ThemeFamily,
+    pub light_theme_index: usize,
+    pub dark_theme_index: usize,
     pub compact: bool,
     pub run_at_startup: bool,
 }
 
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            appearance: Appearance::System,
+            light_theme_index: theme_catalog::default_index(false),
+            dark_theme_index: theme_catalog::default_index(true),
+            compact: false,
+            run_at_startup: false,
+        }
+    }
+}
+
 impl Preferences {
+    pub fn theme_index(self, dark: bool) -> usize {
+        if dark {
+            self.dark_theme_index
+        } else {
+            self.light_theme_index
+        }
+    }
+
+    pub fn set_theme_index(&mut self, dark: bool, index: usize) {
+        if dark {
+            self.dark_theme_index = index;
+        } else {
+            self.light_theme_index = index;
+        }
+    }
+
+    pub fn theme_id(self, dark: bool) -> &'static str {
+        theme_catalog::get(self.theme_index(dark))
+            .map(|theme| theme.id.as_str())
+            .unwrap_or(if dark {
+                "Default Dark"
+            } else {
+                "Default Light"
+            })
+    }
+
     fn decode(input: &str) -> Self {
         let mut prefs = Self::default();
 
-        if !input.lines().any(|line| line == "version=1") {
+        let valid_version = input
+            .lines()
+            .any(|line| matches!(line, "version=1" | "version=2" | "version=3"));
+
+        if !valid_version {
             return prefs;
         }
 
+        let mut light_id = None;
+        let mut dark_id = None;
+        let mut previous_id = None;
+        let mut legacy_family = None;
+
         for line in input.lines() {
-            if let Some(value) = line.strip_prefix("theme=")
-                && let Some(family) = ThemeFamily::from_raw(value)
-            {
-                prefs.family = family;
+            if let Some(id) = line.strip_prefix("theme_id_light=") {
+                light_id = Some(id.trim().to_owned());
+                continue;
+            }
+
+            if let Some(id) = line.strip_prefix("theme_id_dark=") {
+                dark_id = Some(id.trim().to_owned());
+                continue;
+            }
+
+            if let Some(id) = line.strip_prefix("theme_id=") {
+                previous_id = Some(id.trim().to_owned());
+                continue;
+            }
+
+            if let Some(family) = line.strip_prefix("theme=") {
+                legacy_family = Some(family.trim().to_owned());
+                continue;
             }
 
             match line {
-                "appearance=light" => prefs.appearance = Appearance::Light,
-                "appearance=dark" => prefs.appearance = Appearance::Dark,
-                "appearance=system" => prefs.appearance = Appearance::System,
-                "density=compact" => prefs.compact = true,
-                "density=comfortable" => prefs.compact = false,
-                "startup=true" => prefs.run_at_startup = true,
-                "startup=false" => prefs.run_at_startup = false,
-                _ => (),
+                "appearance=light" => {
+                    prefs.appearance = Appearance::Light;
+                }
+                "appearance=dark" => {
+                    prefs.appearance = Appearance::Dark;
+                }
+                "appearance=system" => {
+                    prefs.appearance = Appearance::System;
+                }
+                "density=compact" => {
+                    prefs.compact = true;
+                }
+                "density=comfortable" => {
+                    prefs.compact = false;
+                }
+                "startup=true" => {
+                    prefs.run_at_startup = true;
+                }
+                "startup=false" => {
+                    prefs.run_at_startup = false;
+                }
+                _ => {}
             }
+        }
+
+        if let Some(family) = legacy_family {
+            prefs.light_theme_index = theme_catalog::legacy_family_index(&family, false);
+
+            prefs.dark_theme_index = theme_catalog::legacy_family_index(&family, true);
+        }
+
+        if let Some(id) = previous_id
+            && let Some(index) = theme_catalog::index_of(&id)
+            && let Some(theme) = theme_catalog::get(index)
+        {
+            prefs.set_theme_index(theme.dark, index);
+        }
+
+        if let Some(id) = light_id
+            && let Some(index) = theme_catalog::index_of(&id)
+            && theme_catalog::get(index).is_some_and(|theme| !theme.dark)
+        {
+            prefs.light_theme_index = index;
+        }
+
+        if let Some(id) = dark_id
+            && let Some(index) = theme_catalog::index_of(&id)
+            && theme_catalog::get(index).is_some_and(|theme| theme.dark)
+        {
+            prefs.dark_theme_index = index;
         }
 
         prefs
@@ -219,9 +172,15 @@ impl Preferences {
 
     fn encode(self) -> String {
         format!(
-            "version=1\nappearance={}\ntheme={}\ndensity={}\nstartup={}\n",
+            "version=3\n\
+             appearance={}\n\
+             theme_id_light={}\n\
+             theme_id_dark={}\n\
+             density={}\n\
+             startup={}\n",
             self.appearance.raw(),
-            self.family.raw(),
+            self.theme_id(false),
+            self.theme_id(true),
             if self.compact {
                 "compact"
             } else {
@@ -243,7 +202,9 @@ impl Preferences {
             io::Error::new(io::ErrorKind::NotFound, "No user configuration directory")
         })?;
 
-        let parent = dest.parent().expect("preferences file has a directory");
+        let parent = dest
+            .parent()
+            .ok_or_else(|| io::Error::other("Invalid preferences directory"))?;
 
         fs::create_dir_all(parent)?;
 
@@ -267,18 +228,19 @@ fn pref_path() -> Option<PathBuf> {
     if cfg!(windows) {
         env::var_os("APPDATA")
             .map(PathBuf::from)
-            .map(|path| path.join("Vermouth").join("preferences.conf"))
+            .map(|path| path.join("vermouth-frontend").join("preferences.conf"))
     } else {
         env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-            .map(|path| path.join("Vermouth").join("preferences.conf"))
+            .map(|path| path.join("vermouth-frontend").join("preferences.conf"))
     }
 }
 
 pub fn set_run_at_startup(enable: bool) -> io::Result<()> {
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
         use std::process::Command;
 
         const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
@@ -303,6 +265,8 @@ pub fn set_run_at_startup(enable: bool) -> io::Result<()> {
             cmd.args(["delete", KEY, "/v", "Vermouth", "/f"]);
         }
 
+        cmd.creation_flags(0x08000000);
+
         let output = cmd.output()?;
 
         if output.status.success() {
@@ -320,7 +284,7 @@ pub fn set_run_at_startup(enable: bool) -> io::Result<()> {
 
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "Run at startup is not yet supported on this platform",
+            "Run at startup is not supported on this platform",
         ))
     }
 }
@@ -330,23 +294,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preferences_round_trip_and_legacy_format() {
-        let prefs = Preferences {
+    fn preferences_round_trip() {
+        let mut prefs = Preferences {
             appearance: Appearance::Dark,
-            family: ThemeFamily::Gruvbox,
             compact: true,
             run_at_startup: true,
+            ..Preferences::default()
         };
 
-        assert_eq!(Preferences::decode(&prefs.encode()), prefs);
+        let index = theme_catalog::index_of("Catppuccin Macchiato").expect("Macchiato must exist");
 
-        assert_eq!(
-            Preferences::decode("version=1\nappearance=dark\n").family,
-            ThemeFamily::Default
+        prefs.set_theme_index(true, index);
+
+        assert_eq!(Preferences::decode(&prefs.encode()), prefs);
+    }
+
+    #[test]
+    fn migrates_original_family_preferences() {
+        let prefs = Preferences::decode(
+            "version=1\n\
+             appearance=dark\n\
+             theme=catppuccin\n\
+             density=comfortable\n\
+             startup=false\n",
         );
 
+        assert_eq!(prefs.theme_id(false), "Catppuccin Latte");
+
+        assert_eq!(prefs.theme_id(true), "Catppuccin Mocha");
+    }
+
+    #[test]
+    fn migrates_previous_exact_theme_preferences() {
+        let prefs = Preferences::decode(
+            "version=2\n\
+             appearance=dark\n\
+             theme_id=Catppuccin Macchiato\n",
+        );
+
+        assert_eq!(prefs.theme_id(true), "Catppuccin Macchiato");
+    }
+
+    #[test]
+    fn light_and_dark_selections_are_independent() {
+        let mut prefs = Preferences::default();
+
+        let macchiato = theme_catalog::index_of("Catppuccin Macchiato").unwrap();
+
+        let latte = theme_catalog::index_of("Catppuccin Latte").unwrap();
+
+        prefs.set_theme_index(true, macchiato);
+        prefs.set_theme_index(false, latte);
+
+        assert_eq!(prefs.theme_id(true), "Catppuccin Macchiato");
+
+        assert_eq!(prefs.theme_id(false), "Catppuccin Latte");
+    }
+
+    #[test]
+    fn invalid_version_uses_defaults() {
         assert_eq!(
-            Preferences::decode("version=999\nappearance=dark"),
+            Preferences::decode("version=999\nappearance=dark\n"),
             Preferences::default()
         );
     }

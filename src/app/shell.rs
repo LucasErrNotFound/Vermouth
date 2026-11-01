@@ -1,6 +1,7 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::base::h_flex;
 use gpui_kit::component::TitleBar;
+use gpui_kit::component::sidebar::SidebarItem;
 use gpui_kit::prelude::FluentBuilder as _;
 
 use gpui_kit::component::{
@@ -8,12 +9,11 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     popover::Popover,
     scroll::ScrollableElement as _,
-    sidebar::{
-        Sidebar, SidebarGroup, SidebarItem, SidebarMenu, SidebarMenuItem, SidebarToggleButton,
-    },
+    sidebar::{Sidebar, SidebarGroup, SidebarMenu, SidebarMenuItem, SidebarToggleButton},
     switch::Switch,
     tooltip::Tooltip,
 };
+
 use gpui_kit::*;
 
 use crate::app_assets::APP_ICON_PATH;
@@ -24,7 +24,7 @@ use crate::{
         cameras::CamerasView, diagnostics::DiagnosticsView, live_view::LiveView,
         recordings::RecordingsView, settings::SettingsView,
     },
-    persistence::{Appearance, Preferences, ThemeFamily},
+    persistence::{Appearance, Preferences, theme_catalog},
 };
 
 const GITHUB_REPOSITORY_URL: &str = "https://github.com/LucasErrNotFound/Vermouth";
@@ -74,9 +74,12 @@ pub struct AppShell {
 impl AppShell {
     pub fn new(prefs: Preferences, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let catalog = cx.new(|_| CameraCatalog::new());
-        let settings = cx.new(|_| SettingsView::new(prefs));
 
-        let settings_observer = cx.observe(&settings, |_, _, cx| cx.notify());
+        let settings = cx.new(|cx| SettingsView::new(prefs, cx));
+
+        let settings_observer = cx.observe(&settings, |_, _, cx| {
+            cx.notify();
+        });
 
         let cameras = cx.new(|cx| CamerasView::new(catalog.clone(), window, cx));
 
@@ -95,13 +98,18 @@ impl AppShell {
     }
 
     fn navigate(&mut self, page: Page, cx: &mut Context<Self>) {
-        if self.page != page {
-            if page != Page::Live {
-                self.live.update(cx, |live, cx| live.stop_ptz_control(cx));
-            }
-            self.page = page;
-            cx.notify();
+        if self.page == page {
+            return;
         }
+
+        if page != Page::Live {
+            self.live.update(cx, |live, cx| {
+                live.stop_ptz_control(cx);
+            });
+        }
+
+        self.page = page;
+        cx.notify();
     }
 
     fn toggle_sidebar(&mut self, collapsed: bool, cx: &mut Context<Self>) {
@@ -223,9 +231,9 @@ impl AppShell {
         });
     }
 
-    fn set_family(&mut self, family: ThemeFamily, window: &mut Window, cx: &mut Context<Self>) {
+    fn set_theme(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.settings.update(cx, |view, cx| {
-            view.set_family(family, window, cx);
+            view.set_theme(index, window, cx);
         });
     }
 
@@ -233,6 +241,12 @@ impl AppShell {
         let settings = self.settings.read(cx);
         let prefs = settings.preferences();
         let dark = settings.is_dark(cx);
+
+        let selected_index = theme_catalog::resolve(cx, prefs.theme_index(dark), dark);
+
+        let current_theme_name = theme_catalog::get(selected_index)
+            .map(|theme| theme.display_name.clone())
+            .unwrap_or_else(|| "Default".to_owned());
 
         let mode_tooltip = if dark {
             "Switch to light appearance"
@@ -253,18 +267,16 @@ impl AppShell {
         let muted = cx.theme().muted_foreground;
         let border = cx.theme().border;
 
-        let available_themes = ThemeFamily::ALL
-            .into_iter()
-            .filter(|family| SettingsView::has_variant(*family, dark, cx))
-            .collect::<Vec<_>>();
+        let available_themes = SettingsView::available_themes(cx, dark);
 
         let theme_rows = available_themes
             .into_iter()
-            .map(|family| {
-                let selected = prefs.family == family;
-                let name = family.variant_name(dark);
+            .map(|(index, theme)| {
+                let selected = selected_index == index;
 
-                Button::new(format!("popover-theme-{}", family.name(),))
+                let name = theme.display_name.clone();
+
+                Button::new(format!("popover-theme-{index}"))
                     .ghost()
                     .w_full()
                     .flex_shrink_0()
@@ -272,7 +284,7 @@ impl AppShell {
                     .cursor_pointer()
                     .selected(selected)
                     .accessibility_label(name.clone())
-                    .tooltip(format!("Apply the {name} theme"))
+                    .tooltip(format!("Apply {name}"))
                     .child(
                         div()
                             .w_full()
@@ -295,7 +307,7 @@ impl AppShell {
                             ),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.set_family(family, window, cx);
+                        this.set_theme(index, window, cx);
                     }))
             })
             .collect::<Vec<_>>();
@@ -384,7 +396,7 @@ impl AppShell {
                                 div()
                                     .text_sm()
                                     .text_color(muted)
-                                    .child(format!("Current: {}", prefs.family.variant_name(dark))),
+                                    .child(format!("Current: {}", current_theme_name,)),
                             ),
                     )
                     .child(
@@ -441,7 +453,7 @@ impl Render for AppShell {
             .child(
                 h_flex()
                     .items_center()
-                    .gap_1()
+                    .gap_2()
                     .child(self.settings_menu(cx))
                     .child(
                         div()
