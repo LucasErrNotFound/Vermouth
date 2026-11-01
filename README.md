@@ -29,9 +29,7 @@ Rather than tying the experience to one camera brand or a cloud account, Vermout
 
 ## Main screenshot
 
-The Live View workspace keeps the camera feeds at the center, with navigation and contextual controls available when needed.
-
-> **No screenshot yet.** A screenshot of the actual running application will be added here.
+![Main Screenshot of Vermouth](docs/images/Main_Screenshot.png)
 
 ## Showcase
 
@@ -39,41 +37,25 @@ The Live View workspace keeps the camera feeds at the center, with navigation an
 
 Watch multiple streams in an adaptive grid, select a camera, and switch to a focused view. The application is designed to adapt to window resizing rather than rely on a single fixed desktop resolution.
 
-> **Demo capture pending.**
-
-<!--
-![Vermouth Live View demonstration](docs/gifs/live-view.gif)
--->
+![Vermouth Live View demonstration](docs/gifs/Live_View.gif)
 
 ### Camera management
 
 Add, edit, connect, disconnect, retry, and remove configured RTSP cameras. The Cameras page also includes best-effort private-network discovery to help identify possible camera services; finding a device does not guarantee a usable video stream.
 
-> **Demo capture pending.**
-
-<!--
-![Vermouth camera management demonstration](docs/gifs/camera-management.gif)
--->
+![Vermouth camera management demonstration](docs/gifs/Camera_Management.gif)
 
 ### Camera controls
 
 For supported, authorized cameras, Vermouth exposes ONVIF-based pan, tilt, and zoom controls. Availability and behavior depend on the particular device, its configuration, and the permissions supplied to the app.
 
-> **Demo capture pending.**
-
-<!--
-![Vermouth ONVIF camera controls](docs/gifs/camera-controls.gif)
--->
+![Camera Controls of Vermouth](docs/images/Camera_Controls.png)
 
 ### Appearance and workspace
 
 Switch between light and dark appearances, select a theme family, adjust interface density, and work with the collapsible navigation sidebar.
 
-> **Demo capture pending.**
-
-<!--
-![Vermouth theme and workspace customization](docs/gifs/appearance.gif)
--->
+![Vermouth theme and workspace customization](docs/gifs/Appearance.gif)
 
 ## Themes
 
@@ -85,13 +67,11 @@ Vermouth uses GPUI-Kit's theme system for consistent native controls and a custo
   <tr>
     <td align="center" width="50%">
       <strong>Default Light</strong><br />
-      <em>Screenshot capture pending</em>
-      <!-- <img src="docs/images/themes/light/default-light.png" alt="Vermouth in Default Light" width="480" /> -->
+      <img src="docs/images/Default_Light.png" alt="Vermouth in Default Light" width="480" />
     </td>
     <td align="center" width="50%">
       <strong>Everforest Light</strong><br />
-      <em>Screenshot capture pending</em>
-      <!-- <img src="docs/images/themes/light/everforest-light.png" alt="Vermouth in Everforest Light" width="480" /> -->
+      <img src="docs/images/Everforest_Light.png" alt="Vermouth in Everforest Light" width="480" />
     </td>
   </tr>
 </table>
@@ -102,13 +82,11 @@ Vermouth uses GPUI-Kit's theme system for consistent native controls and a custo
   <tr>
     <td align="center" width="50%">
       <strong>Default Dark</strong><br />
-      <em>Screenshot capture pending</em>
-      <!-- <img src="docs/images/themes/dark/default-dark.png" alt="Vermouth in Default Dark" width="480" /> -->
+      <img src="docs/images/Default_Dark.png" alt="Vermouth in Default Dark" width="480" />
     </td>
     <td align="center" width="50%">
-      <strong>Catppuccin Mocha</strong><br />
-      <em>Screenshot capture pending</em>
-      <!-- <img src="docs/images/themes/dark/catppuccin-mocha.png" alt="Vermouth in Catppuccin Mocha" width="480" /> -->
+      <strong>Molokai Dark</strong><br />
+      <img src="docs/images/Molokai_Dark.png" alt="Vermouth in Molokai Dark" width="480" />
     </td>
   </tr>
 </table>
